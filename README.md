@@ -3,7 +3,7 @@
 
 Sling files between your smartphone (iPhone or Android) and your Linux PC with **zero apps to install on your mobile device**. Scan the QR code in the bar and the transfer portal opens in your phone's browser.
 
-![Sling Preview](./screenshot.png)
+![Sling Preview](./preview.png)
 
 ---
 
