@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Effects
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -41,7 +42,8 @@ BarWidget {
       btn_send: "📤 Send file…",
       waiting: "waiting to be fetched",
       hint_start: "Press Start to show the QR code",
-      same_wifi: "Same Wi-Fi required"
+      same_wifi: "Same Wi-Fi required",
+      idle: "Ready — waiting for a file"
     },
     sv: {
       tooltip: "Sling (Fildelning mobil ↔ dator)\nKlicka för att visa QR-kod",
@@ -55,7 +57,8 @@ BarWidget {
       btn_send: "📤 Skicka fil…",
       waiting: "väntar att hämtas",
       hint_start: "Tryck Starta för att visa QR-koden",
-      same_wifi: "Kräver samma Wi-Fi"
+      same_wifi: "Kräver samma Wi-Fi",
+      idle: "Redo — väntar på en fil"
     },
     nl: {
       tooltip: "Sling (Bestandsoverdracht Telefoon ↔ PC)\nKlik voor QR-code",
@@ -69,7 +72,8 @@ BarWidget {
       btn_send: "📤 Bestand sturen…",
       waiting: "wacht om opgehaald te worden",
       hint_start: "Druk op Starten voor de QR-code",
-      same_wifi: "Vereist dezelfde Wi-Fi"
+      same_wifi: "Vereist dezelfde Wi-Fi",
+      idle: "Gereed — wacht op een bestand"
     },
     ja: {
       tooltip: "Sling (スマホ ↔ PC ファイル転送)\nクリックしてQRコードを表示",
@@ -83,7 +87,8 @@ BarWidget {
       btn_send: "📤 ファイルを送信…",
       waiting: "取得待ち",
       hint_start: "開始を押すとQRコードを表示します",
-      same_wifi: "同じWi-Fi接続が必要です"
+      same_wifi: "同じWi-Fi接続が必要です",
+      idle: "待機中 — ファイルを待っています"
     },
     de: {
       tooltip: "Sling (Dateiübertragung Handy ↔ PC)\nKlicken für QR-Code",
@@ -97,7 +102,8 @@ BarWidget {
       btn_send: "📤 Datei senden…",
       waiting: "warten auf Abruf",
       hint_start: "Start drücken, um den QR-Code zu zeigen",
-      same_wifi: "Gleiches WLAN erforderlich"
+      same_wifi: "Gleiches WLAN erforderlich",
+      idle: "Bereit — wartet auf eine Datei"
     },
     fr: {
       tooltip: "Sling (Transfert Téléphone ↔ PC)\nCliquer pour le code QR",
@@ -111,7 +117,8 @@ BarWidget {
       btn_send: "📤 Envoyer un fichier…",
       waiting: "en attente de téléchargement",
       hint_start: "Appuyez sur Démarrer pour afficher le QR",
-      same_wifi: "Même Wi-Fi requis"
+      same_wifi: "Même Wi-Fi requis",
+      idle: "Prêt — en attente d'un fichier"
     },
     es: {
       tooltip: "Sling (Transferencia Móvil ↔ PC)\nHaz clic para código QR",
@@ -125,7 +132,8 @@ BarWidget {
       btn_send: "📤 Enviar archivo…",
       waiting: "esperando descarga",
       hint_start: "Pulsa Iniciar para ver el código QR",
-      same_wifi: "Misma red Wi-Fi requerida"
+      same_wifi: "Misma red Wi-Fi requerida",
+      idle: "Listo — esperando un archivo"
     },
     zh: {
       tooltip: "Sling (手机 ↔ 电脑 文件传输)\n点击显示二维码",
@@ -139,7 +147,8 @@ BarWidget {
       btn_send: "📤 发送文件…",
       waiting: "等待获取",
       hint_start: "点击启动显示二维码",
-      same_wifi: "需要连接到同一 Wi-Fi"
+      same_wifi: "需要连接到同一 Wi-Fi",
+      idle: "就绪 — 等待文件"
     }
   })
 
@@ -229,8 +238,19 @@ BarWidget {
     bar: root.bar
     owner: root
     open: root.popupOpen
+    borderColor: root.neonCyan
+    borderSpec: Border.controlSpec("normal", root.neonCyan, root.neonCyan)
     contentWidth: popup.fittedContentWidth(Style.space(340))
     contentHeight: popup.fittedContentHeight(popCol.implicitHeight)
+
+    // Mockupens yta: obsidian #0d1117 innanför kortets egen ram (plattan ligger
+    // innanför kanten så ramen syns kvar). Temats popupfärg var grå.
+    Rectangle {
+      anchors.fill: parent
+      anchors.margins: -(popup.padding - Math.max(1, Style.space(2)))
+      radius: Style.cornerRadius - Math.max(1, Style.space(2))
+      color: "#0d1117"
+    }
 
     Column {
       id: popCol
@@ -263,11 +283,23 @@ BarWidget {
           width: parent.width - Style.space(58)
 
           Text {
-            text: root.str.title
-            color: root.bar.foreground
+            id: wordmark
+            text: "SLING"
+            color: "#ffffff"
             font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.subtitle
+            font.pixelSize: Style.font.heading
             font.bold: true
+            font.letterSpacing: Style.space(3)
+            // Neon-glöden från mockupen (magenta halo, ingen förskjutning).
+            layer.enabled: true
+            layer.effect: MultiEffect {
+              shadowEnabled: true
+              shadowColor: root.neonMagenta
+              shadowBlur: 1.0
+              blurMax: 24
+              shadowVerticalOffset: 0
+              shadowHorizontalOffset: 0
+            }
           }
 
           Text {
@@ -277,6 +309,14 @@ BarWidget {
             font.pixelSize: Style.font.bodySmall
           }
         }
+      }
+
+      // Avdelarlinjen under rubriken (mockupen: tunt cyan streck)
+      Rectangle {
+        width: parent.width
+        height: 1
+        color: root.neonCyan
+        opacity: 0.35
       }
 
       // QR Code Container Card — QR bara när den finns, annars en ledtråd
@@ -433,13 +473,13 @@ BarWidget {
         }
       }
 
-      // Förloppsindikator — visas medan en fil över 1 MB rullar (riktning, namn, procent, fart)
+      // Transfer-dock (mockupen): alltid synlig. Visar riktning, fil, procent och
+      // fart medan en fil rullar; annars en dämpad rad och tom stapel.
       BorderSurface {
         width: parent.width
-        visible: root.transfer !== null && root.transfer.total >= 1048576
-        height: Style.space(70)
+        height: Style.space(74)
         radius: Style.space(6)
-        color: Qt.rgba(0, 0.94, 1, 0.07)
+        color: Qt.rgba(0, 0.94, 1, root.transfer ? 0.07 : 0.03)
         borderSpec: Border.controlSpec("normal", root.neonCyan, root.neonCyan)
 
         Column {
@@ -449,12 +489,13 @@ BarWidget {
 
           Item {
             width: parent.width
-            height: Style.space(16)
+            height: Style.space(20)
 
             Text {
-              text: (root.transfer && root.transfer.dir === "up" ? "📥 " : "📤 ")
-                    + (root.transfer ? root.transfer.name : "")
-              color: root.bar.foreground
+              text: root.transfer
+                    ? (root.transfer.dir === "up" ? "📥 " : "📤 ") + root.transfer.name
+                    : root.str.idle
+              color: root.transfer ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.5)
               font.family: root.bar.fontFamily
               font.pixelSize: Style.font.bodySmall
               font.bold: true
@@ -465,10 +506,10 @@ BarWidget {
             Text {
               id: pctText
               anchors.right: parent.right
-              text: root.transfer ? root.transfer.pct + " %" : ""
-              color: root.neonCyan
+              text: root.transfer ? root.transfer.pct + " %" : "—"
+              color: root.transfer ? root.neonCyan : Qt.darker(root.bar.foreground, 1.6)
               font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.bodySmall
+              font.pixelSize: Style.font.title
               font.bold: true
             }
           }

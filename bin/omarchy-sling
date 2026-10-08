@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 VERSION = "1.2.0"
@@ -47,6 +48,8 @@ for _d in (RECEIVED_DIR, SEND_DIR, STATE_DIR, LOG_DIR):
 
 LAST_ACTIVITY = {"t": time.monotonic()}
 _TOKEN = ""
+# Sätts i cmd_server: den processen ÄR servern och får inte hämta sin egen status.
+IS_SERVER = False
 
 # Pågående överföring — panelen ritar en förloppsindikator av den här posten.
 # ponytail: en global post, sista skrivaren vinner. Räcker för en telefon i taget;
@@ -697,7 +700,7 @@ def status_dict(running=None):
         running = port_open()
     if running:
         generate_qr(server_url(token, ip))
-    return {
+    data = {
         "ok": True,
         "version": VERSION,
         "running": bool(running),
@@ -715,13 +718,31 @@ def status_dict(running=None):
         "send_files": list_files(SEND_DIR),
         "active": active_dict(),
     }
+    # En pågående överföring finns bara i serverprocessens minne. CLI:t — och
+    # därmed panelens poll — måste hämta den från serverns eget /status; annars
+    # stod docken på "redo" medan en fil rullade (mätt).
+    if running and not IS_SERVER:
+        live = server_status(token)
+        if live and "active" in live:
+            data["active"] = live["active"]
+    return data
+
+
+def server_status(token):
+    """Serverns egen /status, eller None om den inte svarar."""
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:%d/t/%s/status" % (PORT, token), timeout=2) as r:
+            return json.loads(r.read())
+    except Exception:
+        return None
 
 
 # ------------------------------------------------------------------------------
 # Kommandon
 # ------------------------------------------------------------------------------
 def cmd_server():
-    global _TOKEN
+    global _TOKEN, IS_SERVER
+    IS_SERVER = True
     _TOKEN = secrets.token_urlsafe(9)
     with open(TOKEN_FILE, "w") as fh:
         fh.write(_TOKEN)
@@ -999,6 +1020,17 @@ def cmd_selftest():
         check("  ... med filnamn, total och progress", bool(seen) and seen["name"] == "stor3.bin"
               and seen["total"] == len(body) and 0 < seen["pct"] < 100, str(seen and seen.get("pct")))
         check("  ... och en fart i byte/s", bool(seen) and seen["speed"] > 0, str(seen and round(seen.get("speed", 0))))
+
+        # Panelens egen väg: `omarchy-sling status` (CLI) måste visa samma pågående
+        # överföring — den finns bara i serverprocessens minne och läses ur /status.
+        cli = subprocess.run([sys.executable, os.path.abspath(__file__), "status"],
+                             env=env, capture_output=True, text=True, timeout=20)
+        try:
+            cli_active = json.loads(cli.stdout).get("active")
+        except ValueError:
+            cli_active = None
+        check("CLI-status visar samma pågående överföring", bool(cli_active) and cli_active.get("name") == "stor3.bin",
+              (cli_active and "%s %d%%" % (cli_active["name"], cli_active["pct"])) or ("utdata: " + cli.stdout[:60]))
         done.wait(timeout=60)
         check("uppladdningen blev klar (200)", mid.get("status") == 200, str(mid.get("fel") or mid.get("status")))
         stor3 = os.path.join(tmp, "Received", "stor3.bin")
