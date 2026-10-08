@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # ==============================================================================
-# OmaDrop (Omarchy File Drop Daemon & CLI)
-# Part of OmaDrop - https://github.com/alexwest1981/OmaDrop
+# Sling (Omarchy File Drop Daemon & CLI)
+# Part of Sling - https://github.com/alexwest1981/Sling
 #
 # Säkerhetsmodell: servern lyssnar på LAN:et, men varje förfrågan måste bära en
 # token i sökvägen (/t/<token>/...). Token skapas vid start, byts varje gång och
-# följer med i QR-koden. Servern avväpnar sig själv efter OMADROP_IDLE_TIMEOUT
+# följer med i QR-koden. Servern avväpnar sig själv efter SLING_IDLE_TIMEOUT
 # sekunder utan trafik.
 # ==============================================================================
 
@@ -24,22 +24,22 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.1.0"
-PORT = int(os.environ.get("OMADROP_PORT", 5380))
-IDLE_TIMEOUT = int(os.environ.get("OMADROP_IDLE_TIMEOUT", 900))
-MAX_UPLOAD = int(os.environ.get("OMADROP_MAX_UPLOAD", 2 * 1024**3))
-MDNS_NAME = os.environ.get("OMADROP_MDNS_NAME", "omadrop")
+VERSION = "1.2.0"
+PORT = int(os.environ.get("SLING_PORT", 5380))
+IDLE_TIMEOUT = int(os.environ.get("SLING_IDLE_TIMEOUT", 900))
+MAX_UPLOAD = int(os.environ.get("SLING_MAX_UPLOAD", 2 * 1024**3))
+MDNS_NAME = os.environ.get("SLING_MDNS_NAME", "sling")
 
-BASE_DIR = os.path.expanduser(os.environ.get("OMADROP_BASE_DIR", "~/Downloads/OmaDrop"))
+BASE_DIR = os.path.expanduser(os.environ.get("SLING_BASE_DIR", "~/Downloads/Sling"))
 RECEIVED_DIR = os.path.join(BASE_DIR, "Received")
 SEND_DIR = os.path.join(BASE_DIR, "Send")
 
-STATE_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "omadrop")
+STATE_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "sling")
 QR_PATH = os.path.join(STATE_DIR, "qr.png")
 URL_FILE = os.path.join(STATE_DIR, "url")
 PID_FILE = os.path.join(STATE_DIR, "pid")
 TOKEN_FILE = os.path.join(STATE_DIR, "token")
-LOG_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "omadrop")
+LOG_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "sling")
 LOG_PATH = os.path.join(LOG_DIR, "server.log")
 
 for _d in (RECEIVED_DIR, SEND_DIR, STATE_DIR, LOG_DIR):
@@ -48,18 +48,53 @@ for _d in (RECEIVED_DIR, SEND_DIR, STATE_DIR, LOG_DIR):
 LAST_ACTIVITY = {"t": time.monotonic()}
 _TOKEN = ""
 
+# Pågående överföring — panelen ritar en förloppsindikator av den här posten.
+# ponytail: en global post, sista skrivaren vinner. Räcker för en telefon i taget;
+# en dict per anslutning om flera samtidiga överföringar ska visas var för sig.
+ACTIVE = {"dir": "", "name": "", "done": 0, "total": 0, "t0": 0.0}
+
+
+def start_transfer(direction, name, total):
+    ACTIVE.update({"dir": direction, "name": name, "done": 0, "total": total, "t0": time.monotonic()})
+
+
+def bump_transfer(nbytes):
+    ACTIVE["done"] += nbytes
+
+
+def end_transfer():
+    ACTIVE.update({"dir": "", "name": "", "done": 0, "total": 0, "t0": 0.0})
+
+
+def active_dict():
+    """None när inget pågår; annars läge, procent och fart för panelen."""
+    if not ACTIVE["dir"]:
+        return None
+    total, done = ACTIVE["total"], ACTIVE["done"]
+    elapsed = max(time.monotonic() - ACTIVE["t0"], 0.001)
+    return {
+        "dir": ACTIVE["dir"],
+        "name": ACTIVE["name"],
+        "done": done,
+        "total": total,
+        "pct": int(done * 100 / total) if total else 0,
+        "speed": done / elapsed,
+        "human_done": human_size(done),
+        "human_total": human_size(total),
+    }
+
 # ------------------------------------------------------------------------------
 # Notiser i18n (datorns språk)
 # ------------------------------------------------------------------------------
 NOTIF_STRINGS = {
-    "en": {"received_single": "📥 OmaDrop: 1 new file received", "received_multi": "📥 OmaDrop: {count} new files received"},
-    "sv": {"received_single": "📥 OmaDrop: 1 ny fil mottagen", "received_multi": "📥 OmaDrop: {count} nya filer mottagna"},
-    "nl": {"received_single": "📥 OmaDrop: 1 nieuw bestand ontvangen", "received_multi": "📥 OmaDrop: {count} nieuwe bestanden ontvangen"},
-    "ja": {"received_single": "📥 OmaDrop: 1件のファイルを受信しました", "received_multi": "📥 OmaDrop: {count}件のファイルを受信しました"},
-    "de": {"received_single": "📥 OmaDrop: 1 neue Datei empfangen", "received_multi": "📥 OmaDrop: {count} neue Dateien empfangen"},
-    "fr": {"received_single": "📥 OmaDrop: 1 nouveau fichier reçu", "received_multi": "📥 OmaDrop: {count} nouveaux fichiers reçus"},
-    "es": {"received_single": "📥 OmaDrop: 1 archivo nuevo recibido", "received_multi": "📥 OmaDrop: {count} archivos nuevos recibidos"},
-    "zh": {"received_single": "📥 OmaDrop: 收到 1 个新文件", "received_multi": "📥 OmaDrop: 收到 {count} 个新文件"},
+    "en": {"received_single": "📥 Sling: 1 new file received", "received_multi": "📥 Sling: {count} new files received"},
+    "sv": {"received_single": "📥 Sling: 1 ny fil mottagen", "received_multi": "📥 Sling: {count} nya filer mottagna"},
+    "nl": {"received_single": "📥 Sling: 1 nieuw bestand ontvangen", "received_multi": "📥 Sling: {count} nieuwe bestanden ontvangen"},
+    "ja": {"received_single": "📥 Sling: 1件のファイルを受信しました", "received_multi": "📥 Sling: {count}件のファイルを受信しました"},
+    "de": {"received_single": "📥 Sling: 1 neue Datei empfangen", "received_multi": "📥 Sling: {count} neue Dateien empfangen"},
+    "fr": {"received_single": "📥 Sling: 1 nouveau fichier reçu", "received_multi": "📥 Sling: {count} nouveaux fichiers reçus"},
+    "es": {"received_single": "📥 Sling: 1 archivo nuevo recibido", "received_multi": "📥 Sling: {count} archivos nuevos recibidos"},
+    "zh": {"received_single": "📥 Sling: 收到 1 个新文件", "received_multi": "📥 Sling: 收到 {count} 个新文件"},
 }
 
 
@@ -138,7 +173,12 @@ def current_token():
 
 
 def human_size(size):
-    return "%.1f KB" % (size / 1024) if size < 1024 * 1024 else "%.1f MB" % (size / (1024 * 1024))
+    """GB-nivån behövs: en 2 GB-video ska inte stå som '2048.0 MB' i panelen."""
+    if size >= 1024 ** 3:
+        return "%.2f GB" % (size / 1024 ** 3)
+    if size >= 1024 ** 2:
+        return "%.1f MB" % (size / 1024 ** 2)
+    return "%.1f KB" % (size / 1024)
 
 
 def unique_path(directory, filename):
@@ -185,7 +225,7 @@ def generate_qr(url):
 
 
 def start_mdns():
-    """Publicerar omadrop.local → den här datorn, en adress att minnas som
+    """Publicerar sling.local → den här datorn, en adress att minnas som
     överlever att DHCP byter IP. QR-koden använder ändå IP:t: Android löser
     inte .local pålitligt, och en QR som inte fungerar är värre än ett IP."""
     if not shutil.which("avahi-publish-service"):
@@ -202,8 +242,11 @@ def start_mdns():
 # ------------------------------------------------------------------------------
 # Multipart som strömmar till disk
 # ------------------------------------------------------------------------------
-def stream_multipart(rfile, content_type, content_length, save_dir):
+def stream_multipart(rfile, content_type, content_length, save_dir, on_progress=None):
     """Läser multipart-kroppen i bitar och skriver varje fil direkt till disk.
+
+    on_progress(byte, namn) kallas efter varje läst bit (och en gång när en ny
+    dels filnamn är känt), så panelen kan visa hur långt en stor fil har kommit.
 
     Mätt: den tidigare varianten (rfile.read(hela kroppen) + split(boundary)) tog
     540 MB RSS för en 150 MB-fil — en 1 GB-video hade krävt ~3,5 GB.
@@ -231,11 +274,16 @@ def stream_multipart(rfile, content_type, content_length, save_dir):
             saved.append(os.path.basename(out[0]))
             out = None
 
+    def tell(nbytes=0, name=None):
+        if on_progress:
+            on_progress(nbytes, name)
+
     while remaining > 0:
         chunk = rfile.read(min(65536, remaining))
         if not chunk:
             break
         remaining -= len(chunk)
+        tell(len(chunk))
         buf += chunk
 
         while True:
@@ -267,6 +315,7 @@ def stream_multipart(rfile, content_type, content_length, save_dir):
                 if name:
                     path = unique_path(save_dir, name)
                     out = (path, open(path, "wb"))
+                    tell(0, name)
                 state = "data"
 
             else:                                    # data
@@ -300,44 +349,52 @@ PAGE = """<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OmaDrop</title>
+    <title>Sling</title>
     <style>
-        :root {{ --bg:#1a1b26; --card:#24283b; --accent:#7aa2f7; --accent-glow:rgba(122,162,247,.3);
-                 --success:#9ece6a; --fg:#c0caf5; --fg-dim:#7982a9; --border:#414868; }}
+        :root {{ --bg:#0d1117; --card:#161c26; --accent:#00f0ff; --accent-glow:rgba(0,240,255,.22);
+                 --magenta:#ff007f; --violet:#a855f7; --success:#00f0ff; --fg:#e6edf3; --fg-dim:#94a3b8;
+                 --border:rgba(0,240,255,.16);
+                 --mono:ui-monospace,"JetBrains Mono","SF Mono",Menlo,Consolas,monospace; }}
         * {{ box-sizing:border-box; margin:0; padding:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }}
         body {{ background:var(--bg); color:var(--fg); min-height:100vh; padding:24px 16px;
-                display:flex; flex-direction:column; align-items:center; }}
+                display:flex; flex-direction:column; align-items:center;
+                background-image:radial-gradient(120% 60% at 50% -10%, rgba(168,85,247,.18), transparent 60%),
+                                 radial-gradient(90% 50% at 90% 0%, rgba(255,0,127,.13), transparent 60%); }}
         .container {{ width:100%; max-width:460px; }}
         header {{ text-align:center; margin-bottom:24px; }}
-        h1 {{ font-size:26px; color:#fff; font-weight:700; display:flex; align-items:center; justify-content:center; gap:8px; }}
-        p.subtitle {{ color:var(--fg-dim); font-size:14px; margin-top:6px; }}
+        h1 {{ font-size:32px; font-weight:800; letter-spacing:.22em; text-indent:.22em; text-transform:uppercase;
+              color:#fff; text-shadow:0 0 5px var(--magenta), 0 0 16px var(--magenta), 0 0 34px var(--violet); }}
+        p.subtitle {{ color:var(--fg-dim); font-size:14px; margin-top:8px; }}
         .card {{ background:var(--card); border:1px solid var(--border); border-radius:18px; padding:22px;
-                 box-shadow:0 10px 30px rgba(0,0,0,.35); margin-bottom:20px; }}
+                 box-shadow:0 10px 30px rgba(0,0,0,.45), inset 0 0 40px rgba(0,240,255,.03); margin-bottom:20px; }}
         .dropzone {{ border:2px dashed var(--accent); border-radius:14px; padding:36px 16px; text-align:center;
-                     background:rgba(122,162,247,.06); cursor:pointer; transition:all .2s cubic-bezier(.4,0,.2,1); }}
-        .dropzone:active {{ background:var(--accent-glow); transform:scale(.98); }}
-        .dropzone-icon {{ font-size:52px; margin-bottom:12px; }}
+                     background:rgba(0,240,255,.05); cursor:pointer; transition:all .2s cubic-bezier(.4,0,.2,1); }}
+        .dropzone:active {{ background:var(--accent-glow); transform:scale(.98); box-shadow:0 0 24px var(--accent-glow); }}
+        .dropzone-icon {{ font-size:52px; margin-bottom:12px; filter:drop-shadow(0 0 10px rgba(0,240,255,.55)); }}
         .dropzone-text {{ font-size:17px; font-weight:700; color:#fff; }}
         .dropzone-sub {{ font-size:13px; color:var(--fg-dim); margin-top:6px; }}
         #fileInput {{ display:none; }}
         #progressContainer {{ display:none; margin-top:20px; }}
-        .progress-bar-bg {{ background:var(--border); height:12px; border-radius:6px; overflow:hidden; }}
-        .progress-bar-fill {{ background:var(--accent); height:100%; width:0%; transition:width .1s linear; }}
-        .progress-status {{ font-size:14px; color:#fff; margin-top:10px; text-align:center; font-weight:600; }}
-        .file-item {{ display:flex; align-items:center; justify-content:space-between; background:rgba(0,0,0,.25);
+        .progress-bar-bg {{ background:rgba(255,255,255,.07); height:12px; border-radius:6px; overflow:hidden;
+                            border:1px solid var(--border); }}
+        .progress-bar-fill {{ background:linear-gradient(90deg,var(--violet),var(--accent)); height:100%; width:0%;
+                              transition:width .1s linear; box-shadow:0 0 14px rgba(0,240,255,.8); }}
+        .progress-status {{ font-family:var(--mono); font-size:13px; color:var(--accent); margin-top:10px;
+                            text-align:center; font-weight:600; }}
+        .file-item {{ display:flex; align-items:center; justify-content:space-between; background:rgba(0,0,0,.3);
                       padding:12px 14px; border-radius:10px; margin-bottom:8px; font-size:14px;
-                      border:1px solid rgba(255,255,255,.05); }}
+                      border:1px solid var(--border); }}
         .file-info {{ display:flex; flex-direction:column; overflow:hidden; max-width:240px; }}
         .file-name {{ color:#fff; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
-        .file-size {{ color:var(--fg-dim); font-size:12px; margin-top:2px; }}
-        .dl-btn {{ background:var(--accent); color:#1a1b26; padding:8px 14px; border-radius:8px; font-size:13px;
-                   font-weight:700; text-decoration:none; flex-shrink:0; }}
+        .file-size {{ color:var(--fg-dim); font-size:12px; margin-top:2px; font-family:var(--mono); }}
+        .dl-btn {{ background:var(--accent); color:#0d1117; padding:8px 14px; border-radius:8px; font-size:13px;
+                   font-weight:700; text-decoration:none; flex-shrink:0; box-shadow:0 0 16px rgba(0,240,255,.35); }}
     </style>
 </head>
 <body>
     <div class="container">
         <header>
-            <h1>🚀 OmaDrop</h1>
+            <h1>Sling</h1>
             <p class="subtitle" id="t-subtitle">Fast wireless file sharing with your PC</p>
         </header>
 
@@ -433,7 +490,7 @@ PAGE = """<!DOCTYPE html>
 
             progressContainer.style.display = 'block';
             progressBar.style.width = '0%';
-            progressBar.style.background = 'var(--accent)';
+            progressBar.style.background = '';   // låt CSS-gradienten styra
             progressStatus.innerText = t.starting;
 
             const xhr = new XMLHttpRequest();
@@ -472,8 +529,8 @@ PAGE = """<!DOCTYPE html>
 </html>"""
 
 
-class OmaDropHandler(BaseHTTPRequestHandler):
-    server_version = "OmaDrop/" + VERSION
+class SlingHandler(BaseHTTPRequestHandler):
+    server_version = "Sling/" + VERSION
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
@@ -500,8 +557,8 @@ class OmaDropHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def _no_token(self):
-        self._send(403, ("OmaDrop is running. Use the link or QR code from the bar panel.\n"
-                         "OmaDrop körs. Använd länken eller QR-koden i panelen.\n").encode())
+        self._send(403, ("Sling is running. Use the link or QR code from the bar panel.\n"
+                         "Sling körs. Använd länken eller QR-koden i panelen.\n").encode())
 
     def do_HEAD(self):
         rest = self._resolve()
@@ -535,15 +592,23 @@ class OmaDropHandler(BaseHTTPRequestHandler):
             name = os.path.basename(urllib.parse.unquote(rest[len("/download/"):]))
             filepath = os.path.join(SEND_DIR, name)
             if name and os.path.isfile(filepath):
+                size = os.path.getsize(filepath)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/octet-stream")
                 # RFC 5987-formen klarar icke-ASCII och kan inte injicera rubriker.
                 self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + urllib.parse.quote(name))
-                self.send_header("Content-Length", str(os.path.getsize(filepath)))
+                self.send_header("Content-Length", str(size))
                 self.end_headers()
-                with open(filepath, "rb") as fh:
-                    while chunk := fh.read(65536):
-                        self.wfile.write(chunk)
+                start_transfer("down", name, size)
+                try:
+                    with open(filepath, "rb") as fh:
+                        while chunk := fh.read(65536):
+                            self.wfile.write(chunk)
+                            bump_transfer(len(chunk))
+                except (BrokenPipeError, ConnectionResetError):
+                    log("avbruten nedladdning: %s" % name)
+                finally:
+                    end_transfer()
             else:
                 self._send(404)
 
@@ -583,24 +648,32 @@ class OmaDropHandler(BaseHTTPRequestHandler):
             self._send(413, json.dumps({"ok": False, "error": "too large"}).encode(), "application/json")
             return
 
+        def track(nbytes, name=None):
+            if name:
+                ACTIVE["name"] = name
+            bump_transfer(nbytes)
+
+        start_transfer("up", "", length)
         try:
-            saved = stream_multipart(self.rfile, ctype, length, RECEIVED_DIR)
+            saved = stream_multipart(self.rfile, ctype, length, RECEIVED_DIR, on_progress=track)
         except OSError as exc:
             log("uppladdning misslyckades: %s" % exc)
             self._send(500, json.dumps({"ok": False, "error": str(exc)}).encode(), "application/json")
             return
+        finally:
+            end_transfer()
 
         if saved:
             key = "received_single" if len(saved) == 1 else "received_multi"
             summary = NOTIF_STRINGS[get_system_lang()][key].format(count=len(saved))
             body = ", ".join(saved[:3]) + (" (+%d)" % (len(saved) - 3) if len(saved) > 3 else "")
-            subprocess.run(["notify-send", summary, body, "--icon=folder-download", "-a", "OmaDrop"], check=False)
+            subprocess.run(["notify-send", summary, body, "--icon=folder-download", "-a", "Sling"], check=False)
             log("tog emot %d fil(er): %s" % (len(saved), body))
 
         self._send(200, json.dumps({"ok": True, "saved": saved}).encode(), "application/json")
 
 
-class OmaDropServer(ThreadingHTTPServer):
+class SlingServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def server_bind(self):
@@ -610,7 +683,7 @@ class OmaDropServer(ThreadingHTTPServer):
         medan ingenting svarade."""
         import socketserver
         socketserver.TCPServer.server_bind(self)
-        self.server_name = "omadrop"
+        self.server_name = "sling"
         self.server_port = self.server_address[1]
 
 
@@ -640,6 +713,7 @@ def status_dict(running=None):
         "send_dir": SEND_DIR,
         "recent_files": list_files(RECEIVED_DIR, 5),
         "send_files": list_files(SEND_DIR),
+        "active": active_dict(),
     }
 
 
@@ -657,7 +731,7 @@ def cmd_server():
         fh.write(str(os.getpid()))
 
     mdns = start_mdns()
-    server = OmaDropServer(("0.0.0.0", PORT), OmaDropHandler)
+    server = SlingServer(("0.0.0.0", PORT), SlingHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     qr_ok = generate_qr(url)
     log("lyssnar på 0.0.0.0:%d, mDNS=%s, qr_ok=%s, token=%s..." % (PORT, bool(mdns), qr_ok, _TOKEN[:4]))
@@ -687,17 +761,17 @@ def cmd_server():
 
 def cmd_start():
     if port_open():
-        print("OmaDrop is already running.")
+        print("Sling is already running.")
         return 0
     with open(LOG_PATH, "a") as logfh:
         subprocess.Popen([sys.executable, os.path.abspath(__file__), "server"],
                          stdout=logfh, stderr=logfh, start_new_session=True)
     for _ in range(50):                     # upp till ~5 s
         if port_open():
-            print("OmaDrop started: %s" % server_url(read_token()))
+            print("Sling started: %s" % server_url(read_token()))
             return 0
         time.sleep(0.1)
-    print("OmaDrop did not come up — se %s" % LOG_PATH, file=sys.stderr)
+    print("Sling did not come up — se %s" % LOG_PATH, file=sys.stderr)
     return 1
 
 
@@ -718,8 +792,8 @@ def cmd_stop():
         except ProcessLookupError:
             pass
     if port_open():
-        subprocess.run(["pkill", "-f", "omarchy-omadrop server"], check=False)
-    print("OmaDrop stopped.")
+        subprocess.run(["pkill", "-f", "omarchy-sling server"], check=False)
+    print("Sling stopped.")
     return 0
 
 
@@ -758,7 +832,7 @@ def cmd_send_pick():
         subprocess.run(["xdg-open", SEND_DIR], check=False)
         return 1
     r = subprocess.run(["zenity", "--file-selection", "--multiple", "--separator=\n",
-                        "--title=OmaDrop: skicka till telefonen"],
+                        "--title=Sling: skicka till telefonen"],
                        capture_output=True, text=True)
     paths = [line for line in r.stdout.splitlines() if line.strip()]
     return cmd_send(paths) if paths else 1
@@ -774,15 +848,15 @@ def cmd_selftest():
     import urllib.error
     import urllib.request
 
-    tmp = tempfile.mkdtemp(prefix="omadrop-selftest-")
-    port = int(os.environ.get("OMADROP_SELFTEST_PORT", "5381"))
+    tmp = tempfile.mkdtemp(prefix="sling-selftest-")
+    port = int(os.environ.get("SLING_SELFTEST_PORT", "5381"))
     env = dict(os.environ,
-               OMADROP_PORT=str(port),
-               OMADROP_BASE_DIR=tmp,
-               OMADROP_IDLE_TIMEOUT="60",
-               OMADROP_MAX_UPLOAD="2097152",            # 2 MB i provet
+               SLING_PORT=str(port),
+               SLING_BASE_DIR=tmp,
+               SLING_IDLE_TIMEOUT="60",
+               SLING_MAX_UPLOAD="2097152",            # 2 MB i provet
                XDG_RUNTIME_DIR=tmp,
-               OMADROP_MDNS_NAME="omadrop-test")
+               SLING_MDNS_NAME="sling-test")
     proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), "server"],
                             env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     failures = []
@@ -795,7 +869,7 @@ def cmd_selftest():
             failures.append(name)
 
     def multipart(files):
-        b = "----omadroptest"
+        b = "----slingtest"
         out = b""
         for name, data in files:
             out += ("--%s\r\nContent-Disposition: form-data; name=\"files\"; filename=\"%s\"\r\n"
@@ -822,7 +896,7 @@ def cmd_selftest():
             except Exception:
                 time.sleep(0.1)
 
-        with open(os.path.join(tmp, "omadrop", "token")) as fh:
+        with open(os.path.join(tmp, "sling", "token")) as fh:
             token = fh.read().strip()
 
         payloads = [
@@ -843,7 +917,7 @@ def cmd_selftest():
         # En kropp som innehåller själva gränssträngen går inte att representera i
         # multipart (avsändaren ska välja en gräns som inte förekommer i innehållet).
         # Det som måste hålla är att parsern inte tappar bort de följande delarna.
-        fake = b"\r\n----omadroptest\r\n" * 5000
+        fake = b"\r\n----slingtest\r\n" * 5000
         real = os.urandom(200_000)
         code, reply = post([("gräns.bin", fake), ("efter.bin", real)], token)
         check("del efter gräns-kropp kommer fram", os.path.isfile(os.path.join(tmp, "Received", "efter.bin")),
@@ -871,12 +945,68 @@ def cmd_selftest():
 
         with urllib.request.urlopen("http://127.0.0.1:%d/t/%s/" % (port, token), timeout=5) as r:
             page = r.read().decode()
-        check("mobilsidan renderas (200)", "OmaDrop" in page)
+        check("mobilsidan renderas (200)", "Sling" in page)
 
         with urllib.request.urlopen("http://127.0.0.1:%d/t/%s/status" % (port, token), timeout=5) as r:
             st = json.loads(r.read())
         check("status har running/url/qr_ok", all(k in st for k in ("running", "url", "qr_ok")))
         check("status-url bär token", token in st["url"], st["url"])
+        check("status har active-nyckeln (None när inget pågår)", st.get("active") is None, str(st.get("active")))
+
+        # Förloppsindikatorn mäts mitt i en överföring. Kroppen skickas i bitar med
+        # paus, så servern står kvar i läsningen och 'active' går att se — till
+        # skillnad från att hoppas att en nedladdning inte hinner klart i bufferten.
+        class SlowBody:
+            def __init__(self, data, chunk=65536, delay=0.08):
+                self.data, self.pos, self.chunk, self.delay = data, 0, chunk, delay
+
+            def read(self, n=None):
+                time.sleep(self.delay)
+                piece = self.data[self.pos:self.pos + self.chunk]
+                self.pos += len(piece)
+                return piece
+
+        # Under provets eget tak (2 MB) — annars svarar servern 413 och provet mäter inget.
+        payload = os.urandom(1_500_000)
+        body, ctype = multipart([("stor3.bin", payload)])
+        req = urllib.request.Request("http://127.0.0.1:%d/t/%s/upload" % (port, token), data=SlowBody(body),
+                                     headers={"Content-Type": ctype, "Content-Length": str(len(body))}, method="POST")
+
+        mid = {}
+        done = threading.Event()
+
+        def slow_post():
+            try:
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    mid["status"] = r.status
+                    mid["saved"] = json.loads(r.read()).get("saved")
+            except Exception as exc:                        # noqa: BLE001 — provet rapporterar själv
+                mid["fel"] = repr(exc)
+            done.set()
+
+        threading.Thread(target=slow_post, daemon=True).start()
+        seen = None
+        deadline = time.time() + 20
+        while time.time() < deadline and not done.is_set():
+            with urllib.request.urlopen("http://127.0.0.1:%d/t/%s/status" % (port, token), timeout=5) as r:
+                a = json.loads(r.read()).get("active")
+            if a and a.get("dir") == "up" and a.get("done", 0) > 0:
+                seen = a
+                break
+            time.sleep(0.1)
+        check("pågående uppladdning syns i status", seen is not None,
+              ("%s %d%% %s/%s" % (seen["name"], seen["pct"], seen["human_done"], seen["human_total"])) if seen else "sågs aldrig")
+        check("  ... med filnamn, total och progress", bool(seen) and seen["name"] == "stor3.bin"
+              and seen["total"] == len(body) and 0 < seen["pct"] < 100, str(seen and seen.get("pct")))
+        check("  ... och en fart i byte/s", bool(seen) and seen["speed"] > 0, str(seen and round(seen.get("speed", 0))))
+        done.wait(timeout=60)
+        check("uppladdningen blev klar (200)", mid.get("status") == 200, str(mid.get("fel") or mid.get("status")))
+        stor3 = os.path.join(tmp, "Received", "stor3.bin")
+        check("  ... och filen är byte-identisk",
+              os.path.isfile(stor3) and open(stor3, "rb").read() == payload)
+        with urllib.request.urlopen("http://127.0.0.1:%d/t/%s/status" % (port, token), timeout=5) as r:
+            after = json.loads(r.read()).get("active")
+        check("active är tom igen efteråt", after is None, str(after))
     finally:
         proc.terminate()
         try:
@@ -889,7 +1019,7 @@ def cmd_selftest():
     if failures:
         print("MISSLYCKADE: " + ", ".join(failures))
         return 1
-    print("OmaDrop selftest: OK")
+    print("Sling selftest: OK")
     return 0
 
 
@@ -912,7 +1042,7 @@ def main():
     elif action == "selftest":
         sys.exit(cmd_selftest())
     else:
-        print("Usage: omarchy-omadrop [server | start | stop | status | open | send <fil...> | send-pick | selftest]")
+        print("Usage: omarchy-sling [server | start | stop | status | open | send <fil...> | send-pick | selftest]")
         sys.exit(2)
 
 

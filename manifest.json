@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "custom.omadrop",
-  "name": "OmaDrop",
-  "version": "1.1.0",
+  "id": "io.github.alexwest1981.sling",
+  "name": "Sling",
+  "version": "1.2.0",
   "author": "Alex Weström",
   "license": "MIT",
-  "description": "OmaDrop - Zero-App QR file sharing between phone and PC for Omarchy.",
+  "description": "Sling - Zero-App QR file sharing between phone and PC for Omarchy.",
   "kinds": [
     "bar-widget"
   ],
@@ -13,7 +13,7 @@
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {
-    "displayName": "OmaDrop",
+    "displayName": "Sling",
     "description": "Instant QR code file drop for phone and PC over local Wi-Fi.",
     "category": "Utilities",
     "allowMultiple": false,

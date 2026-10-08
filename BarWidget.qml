@@ -6,7 +6,12 @@ import qs.Ui
 
 BarWidget {
   id: root
-  moduleName: "custom.omadrop"
+  moduleName: "io.github.alexwest1981.sling"
+
+  // Neonpaletten från Sling-mockupen. Accenter — panelens yta följer barens tema,
+  // så widgeten inte krockar med en ljus bar.
+  readonly property color neonCyan: "#00f0ff"
+  readonly property color neonMagenta: "#ff007f"
 
   property bool serverRunning: false
   property bool qrOk: false
@@ -15,6 +20,7 @@ BarWidget {
   property string localIp: "127.0.0.1"
   property var recentFiles: []
   property var sendFiles: []
+  property var transfer: null
   property bool popupOpen: false
   property string qrPath: ""
   property int refreshTrigger: 0
@@ -24,8 +30,8 @@ BarWidget {
   // ---------------------------------------------------------------------------
   readonly property var i18nDict: ({
     en: {
-      tooltip: "OmaDrop (File Transfer Phone ↔ PC)\nClick to show QR code",
-      title: "OmaDrop File Sharing",
+      tooltip: "Sling (File Transfer Phone ↔ PC)\nClick to show QR code",
+      title: "Sling File Sharing",
       subtitle: "Scan with your regular phone camera",
       copied: "Link copied to clipboard!",
       recent_title: "📥 Recently received files:",
@@ -38,8 +44,8 @@ BarWidget {
       same_wifi: "Same Wi-Fi required"
     },
     sv: {
-      tooltip: "OmaDrop (Fildelning mobil ↔ dator)\nKlicka för att visa QR-kod",
-      title: "OmaDrop Fildelning",
+      tooltip: "Sling (Fildelning mobil ↔ dator)\nKlicka för att visa QR-kod",
+      title: "Sling Fildelning",
       subtitle: "Scanna med mobilens vanliga kamera",
       copied: "Länk kopierad till urklipp!",
       recent_title: "📥 Senast mottagna filer:",
@@ -52,8 +58,8 @@ BarWidget {
       same_wifi: "Kräver samma Wi-Fi"
     },
     nl: {
-      tooltip: "OmaDrop (Bestandsoverdracht Telefoon ↔ PC)\nKlik voor QR-code",
-      title: "OmaDrop Bestandsoverdracht",
+      tooltip: "Sling (Bestandsoverdracht Telefoon ↔ PC)\nKlik voor QR-code",
+      title: "Sling Bestandsoverdracht",
       subtitle: "Scan met de camera van je telefoon",
       copied: "Link gekopieerd naar klembord!",
       recent_title: "📥 Recent ontvangen bestanden:",
@@ -66,8 +72,8 @@ BarWidget {
       same_wifi: "Vereist dezelfde Wi-Fi"
     },
     ja: {
-      tooltip: "OmaDrop (スマホ ↔ PC ファイル転送)\nクリックしてQRコードを表示",
-      title: "OmaDrop ファイル共有",
+      tooltip: "Sling (スマホ ↔ PC ファイル転送)\nクリックしてQRコードを表示",
+      title: "Sling ファイル共有",
       subtitle: "スマホの標準カメラでスキャン",
       copied: "リンクをクリップボードにコピーしました！",
       recent_title: "📥 最近受信したファイル:",
@@ -80,8 +86,8 @@ BarWidget {
       same_wifi: "同じWi-Fi接続が必要です"
     },
     de: {
-      tooltip: "OmaDrop (Dateiübertragung Handy ↔ PC)\nKlicken für QR-Code",
-      title: "OmaDrop Dateifreigabe",
+      tooltip: "Sling (Dateiübertragung Handy ↔ PC)\nKlicken für QR-Code",
+      title: "Sling Dateifreigabe",
       subtitle: "Mit der Handykamera scannen",
       copied: "Link in Zwischenablage kopiert!",
       recent_title: "📥 Zuletzt empfangene Dateien:",
@@ -94,8 +100,8 @@ BarWidget {
       same_wifi: "Gleiches WLAN erforderlich"
     },
     fr: {
-      tooltip: "OmaDrop (Transfert Téléphone ↔ PC)\nCliquer pour le code QR",
-      title: "OmaDrop Partage de fichiers",
+      tooltip: "Sling (Transfert Téléphone ↔ PC)\nCliquer pour le code QR",
+      title: "Sling Partage de fichiers",
       subtitle: "Scannez avec l'appareil photo du téléphone",
       copied: "Lien copié dans le presse-papiers !",
       recent_title: "📥 Fichiers récemment reçus :",
@@ -108,8 +114,8 @@ BarWidget {
       same_wifi: "Même Wi-Fi requis"
     },
     es: {
-      tooltip: "OmaDrop (Transferencia Móvil ↔ PC)\nHaz clic para código QR",
-      title: "OmaDrop Compartir archivos",
+      tooltip: "Sling (Transferencia Móvil ↔ PC)\nHaz clic para código QR",
+      title: "Sling Compartir archivos",
       subtitle: "Escanea con la cámara de tu móvil",
       copied: "¡Enlace copiado al portapapeles!",
       recent_title: "📥 Archivos recibidos recientemente:",
@@ -122,8 +128,8 @@ BarWidget {
       same_wifi: "Misma red Wi-Fi requerida"
     },
     zh: {
-      tooltip: "OmaDrop (手机 ↔ 电脑 文件传输)\n点击显示二维码",
-      title: "OmaDrop 文件传输",
+      tooltip: "Sling (手机 ↔ 电脑 文件传输)\n点击显示二维码",
+      title: "Sling 文件传输",
       subtitle: "使用手机相机扫码",
       copied: "链接已复制到剪贴板！",
       recent_title: "📥 最近接收的文件:",
@@ -157,7 +163,7 @@ BarWidget {
   // ---------------------------------------------------------------------------
   Process {
     id: statusProc
-    command: ["omarchy-omadrop", "status"]
+    command: ["omarchy-sling", "status"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -170,10 +176,11 @@ BarWidget {
           root.localIp = data.ip || ""
           root.recentFiles = data.recent_files || []
           root.sendFiles = data.send_files || []
+          root.transfer = data.active || null
           root.qrPath = data.qr_path || ""
           root.refreshTrigger += 1
         } catch (e) {
-          console.warn("OmaDrop: status JSON not readable: " + e)
+          console.warn("Sling: status JSON not readable: " + e)
         }
       }
     }
@@ -181,7 +188,7 @@ BarWidget {
 
   Timer {
     id: statusTimer
-    interval: root.popupOpen ? 1500 : 10000
+    interval: (root.popupOpen || root.transfer !== null) ? 1500 : 10000
     running: true
     repeat: true
     triggeredOnStart: true
@@ -190,8 +197,8 @@ BarWidget {
     }
   }
 
-  function runOmaDrop(action) {
-    Quickshell.execDetached(["omarchy-omadrop", action])
+  function runSling(action) {
+    Quickshell.execDetached(["omarchy-sling", action])
     statusTimer.restart()
   }
 
@@ -202,12 +209,12 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "󰄡 Drop"
+    text: root.transfer ? "󰄡 " + root.transfer.pct + "%" : "󰄡 Sling"
     active: root.popupOpen || root.serverRunning
     tooltipText: root.str.tooltip
     onPressed: function(btn) {
       if (!root.serverRunning) {
-        runOmaDrop("start")
+        runSling("start")
       }
       root.popupOpen = !root.popupOpen
     }
@@ -239,13 +246,13 @@ BarWidget {
           width: Style.space(46)
           height: Style.space(46)
           radius: Style.spacing.labelGap
-          color: Style.normalFillFor(root.bar.foreground, Color.accent)
-          borderSpec: Border.controlSpec("normal", root.bar.foreground, Color.accent)
+          color: Qt.rgba(0, 0.94, 1, 0.10)
+          borderSpec: Border.controlSpec("normal", root.neonCyan, root.neonCyan)
 
           Text {
             anchors.centerIn: parent
             text: "󰄡"
-            color: Color.accent
+            color: root.neonMagenta
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.display
           }
@@ -275,34 +282,70 @@ BarWidget {
       // QR Code Container Card — QR bara när den finns, annars en ledtråd
       BorderSurface {
         width: parent.width
-        height: Style.space(230)
+        height: Style.space(246)
         radius: Style.spacing.labelGap
-        color: Qt.darker(root.bar.background || "#1a1b26", 1.3)
-        borderSpec: Border.controlSpec("normal", root.bar.foreground, Color.accent)
+        color: Qt.darker(root.bar.background || "#0d1117", 1.3)
+        borderSpec: Border.controlSpec("normal", root.neonCyan, root.neonCyan)
 
         Column {
           anchors.centerIn: parent
           spacing: Style.space(8)
 
-          // Crisp White Canvas for QR Code
-          Rectangle {
+          // QR-koden med retikeln från mockupen: vit yta med neon-cyan hörnparenteser
+          Item {
             anchors.horizontalCenter: parent.horizontalCenter
-            width: Style.space(160)
-            height: Style.space(160)
-            radius: Style.space(10)
-            color: "#ffffff"
+            width: Style.space(176)
+            height: Style.space(176)
             visible: root.serverRunning && root.qrOk
 
-            Image {
-              id: qrImg
-              anchors.centerIn: parent
-              width: Style.space(146)
-              height: Style.space(146)
-              fillMode: Image.PreserveAspectFit
-              cache: false
-              source: (root.serverRunning && root.qrOk && root.qrPath !== "")
-                      ? "file://" + root.qrPath + "?v=" + root.refreshTrigger : ""
-              smooth: false
+            // Crisp White Canvas for QR Code
+            Rectangle {
+              anchors.fill: parent
+              anchors.margins: Style.space(8)
+              radius: Style.space(10)
+              color: "#ffffff"
+
+              Image {
+                id: qrImg
+                anchors.centerIn: parent
+                width: Style.space(146)
+                height: Style.space(146)
+                fillMode: Image.PreserveAspectFit
+                cache: false
+                source: (root.serverRunning && root.qrOk && root.qrPath !== "")
+                        ? "file://" + root.qrPath + "?v=" + root.refreshTrigger : ""
+                smooth: false
+              }
+            }
+
+            // Fyra hörn, två streck var: [x-höger, y-neder, x-riktning, y-riktning]
+            Repeater {
+              model: [[0, 0, 1, 1], [1, 0, -1, 1], [0, 1, 1, -1], [1, 1, -1, -1]]
+
+              Item {
+                width: Style.space(18)
+                height: Style.space(18)
+                x: modelData[0] ? parent.width - width : 0
+                y: modelData[1] ? parent.height - height : 0
+
+                Rectangle {
+                  width: parent.width
+                  height: Style.space(2)
+                  radius: Style.space(1)
+                  color: root.neonCyan
+                  x: 0
+                  y: modelData[3] > 0 ? 0 : parent.height - height
+                }
+
+                Rectangle {
+                  width: Style.space(2)
+                  height: parent.height
+                  radius: Style.space(1)
+                  color: root.neonCyan
+                  y: 0
+                  x: modelData[2] > 0 ? 0 : parent.width - width
+                }
+              }
             }
           }
 
@@ -390,6 +433,78 @@ BarWidget {
         }
       }
 
+      // Förloppsindikator — visas medan en fil över 1 MB rullar (riktning, namn, procent, fart)
+      BorderSurface {
+        width: parent.width
+        visible: root.transfer !== null && root.transfer.total >= 1048576
+        height: Style.space(70)
+        radius: Style.space(6)
+        color: Qt.rgba(0, 0.94, 1, 0.07)
+        borderSpec: Border.controlSpec("normal", root.neonCyan, root.neonCyan)
+
+        Column {
+          anchors.fill: parent
+          anchors.margins: Style.space(9)
+          spacing: Style.space(6)
+
+          Item {
+            width: parent.width
+            height: Style.space(16)
+
+            Text {
+              text: (root.transfer && root.transfer.dir === "up" ? "📥 " : "📤 ")
+                    + (root.transfer ? root.transfer.name : "")
+              color: root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+              elide: Text.ElideMiddle
+              width: parent.width - pctText.width - Style.space(6)
+            }
+
+            Text {
+              id: pctText
+              anchors.right: parent.right
+              text: root.transfer ? root.transfer.pct + " %" : ""
+              color: root.neonCyan
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+            }
+          }
+
+          Rectangle {
+            width: parent.width
+            height: Style.space(8)
+            radius: Style.space(4)
+            color: Qt.rgba(1, 1, 1, 0.08)
+
+            Rectangle {
+              height: parent.height
+              radius: parent.radius
+              color: root.neonCyan
+              width: parent.width * (root.transfer ? Math.max(0.02, Math.min(1, root.transfer.pct / 100)) : 0)
+
+              Behavior on width {
+                NumberAnimation { duration: 180 }
+              }
+            }
+          }
+
+          Text {
+            width: parent.width
+            text: root.transfer
+                  ? root.transfer.human_done + " / " + root.transfer.human_total + "  ·  "
+                    + (root.transfer.speed / 1048576).toFixed(1) + " MB/s"
+                  : ""
+            color: Qt.darker(root.bar.foreground, 1.4)
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+          }
+        }
+      }
+
       // Skicka-kön: filer i Send/ som väntar på telefonen
       Text {
         width: parent.width
@@ -470,7 +585,7 @@ BarWidget {
           foreground: root.bar.foreground
           horizontalPadding: Style.spacing.controlPaddingX
           verticalPadding: Style.spacing.controlPaddingY
-          onClicked: root.runOmaDrop("open")
+          onClicked: root.runSling("open")
         }
 
         Button {
@@ -479,21 +594,21 @@ BarWidget {
           foreground: root.bar.foreground
           horizontalPadding: Style.spacing.controlPaddingX
           verticalPadding: Style.spacing.controlPaddingY
-          onClicked: root.runOmaDrop("send-pick")
+          onClicked: root.runSling("send-pick")
         }
       }
 
       Button {
         width: parent.width
         text: root.serverRunning ? root.str.btn_stop : root.str.btn_start
-        foreground: root.serverRunning ? "#f7768e" : "#9ece6a"
+        foreground: root.serverRunning ? "#f7768e" : root.neonCyan
         horizontalPadding: Style.spacing.controlPaddingX
         verticalPadding: Style.spacing.controlPaddingY
         onClicked: {
           if (root.serverRunning) {
-            root.runOmaDrop("stop")
+            root.runSling("stop")
           } else {
-            root.runOmaDrop("start")
+            root.runSling("start")
           }
         }
       }
