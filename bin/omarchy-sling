@@ -25,7 +25,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 PORT = int(os.environ.get("SLING_PORT", 5380))
 IDLE_TIMEOUT = int(os.environ.get("SLING_IDLE_TIMEOUT", 900))
 MAX_UPLOAD = int(os.environ.get("SLING_MAX_UPLOAD", 2 * 1024**3))
@@ -44,7 +44,19 @@ LOG_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.l
 LOG_PATH = os.path.join(LOG_DIR, "server.log")
 
 for _d in (RECEIVED_DIR, SEND_DIR, STATE_DIR, LOG_DIR):
-    os.makedirs(_d, exist_ok=True)
+    # 0700: loggen namnger mottagna filer — ingen annan lokal användare ska kunna läsa den.
+    os.makedirs(_d, mode=0o700, exist_ok=True)
+    if _d in (STATE_DIR, LOG_DIR):
+        # Redan skapade kataloger behåller sin gamla mode; sätt om varje gång.
+        try:
+            os.chmod(_d, 0o700)
+        except OSError:
+            pass
+if os.path.exists(LOG_PATH):
+    try:
+        os.chmod(LOG_PATH, 0o600)
+    except OSError:
+        pass
 
 LAST_ACTIVITY = {"t": time.monotonic()}
 _TOKEN = ""
@@ -108,7 +120,8 @@ def get_system_lang():
 
 def log(msg):
     try:
-        with open(LOG_PATH, "a") as fh:
+        fd = os.open(LOG_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as fh:
             fh.write("%s  %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
     except OSError:
         pass
@@ -206,7 +219,11 @@ def list_files(directory, limit=None):
 
 def generate_qr(url):
     """True om QR-filen finns och är för aktuell URL. Aldrig tyst: skälet hamnar i
-    loggen och som qr_ok=False i status."""
+    loggen och som qr_ok=False i status.
+
+    URL:en (som bär token) går på qrencodes **stdin**, aldrig som argument: en
+    annan lokal användare kan läsa argv ur processlistan och hade då fått token.
+    """
     try:
         with open(URL_FILE) as fh:
             current = fh.read().strip()
@@ -217,13 +234,14 @@ def generate_qr(url):
     if not shutil.which("qrencode"):
         log("qrencode saknas — ingen QR-kod kan skapas")
         return False
-    r = subprocess.run(["qrencode", "-s", "6", "-m", "2", "-o", QR_PATH, url],
-                       capture_output=True, text=True)
+    r = subprocess.run(["qrencode", "-s", "6", "-m", "2", "-o", QR_PATH],
+                       input=url.encode(), capture_output=True)
     if r.returncode != 0 or not os.path.exists(QR_PATH):
-        log("qrencode misslyckades: " + (r.stderr or "").strip())
+        log("qrencode misslyckades: " + (r.stderr or b"").decode("utf-8", "replace").strip())
         return False
     with open(URL_FILE, "w") as fh:
         fh.write(url)
+    os.chmod(URL_FILE, 0o600)
     return True
 
 
@@ -669,9 +687,10 @@ class SlingHandler(BaseHTTPRequestHandler):
         if saved:
             key = "received_single" if len(saved) == 1 else "received_multi"
             summary = NOTIF_STRINGS[get_system_lang()][key].format(count=len(saved))
-            body = ", ".join(saved[:3]) + (" (+%d)" % (len(saved) - 3) if len(saved) > 3 else "")
-            subprocess.run(["notify-send", summary, body, "--icon=folder-download", "-a", "Sling"], check=False)
-            log("tog emot %d fil(er): %s" % (len(saved), body))
+            # Bara antalet i notisen: filnamnen är privat metadata och låg förut i argv,
+            # läsbar för varje lokal användare som ser processlistan.
+            subprocess.run(["notify-send", summary, "--icon=folder-download", "-a", "Sling"], check=False)
+            log("tog emot %d fil(er): %s" % (len(saved), ", ".join(saved[:3])))
 
         self._send(200, json.dumps({"ok": True, "saved": saved}).encode(), "application/json")
 
@@ -755,7 +774,7 @@ def cmd_server():
     server = SlingServer(("0.0.0.0", PORT), SlingHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     qr_ok = generate_qr(url)
-    log("lyssnar på 0.0.0.0:%d, mDNS=%s, qr_ok=%s, token=%s..." % (PORT, bool(mdns), qr_ok, _TOKEN[:4]))
+    log("lyssnar på 0.0.0.0:%d, mDNS=%s, qr_ok=%s" % (PORT, bool(mdns), qr_ok))
 
     def bye(*_):
         raise SystemExit(0)
@@ -825,6 +844,26 @@ def cmd_status():
 
 def cmd_open():
     subprocess.run(["xdg-open", RECEIVED_DIR], check=False)
+    return 0
+
+
+def cmd_copy(which=None):
+    """Lägger serverns URL i urklipp — via stdin, aldrig argv (token!).
+
+    Mätt 2026-10-08: Quickshells `Process` med `stdinEnabled` skickar texten men
+    stänger inte stdin, och `wl-copy` läser till EOF — den kopierade ingenting.
+    Pythons `input=` skickar och stänger, så kopieringen hamnar här i stället.
+    """
+    token = current_token() or read_token()
+    if not token:
+        print("ingen token — starta servern först", file=sys.stderr)
+        return 1
+    url = server_url(token) if which != "mdns" else "http://%s.local:%d/t/%s/" % (MDNS_NAME, PORT, token)
+    if not shutil.which("wl-copy"):
+        print("wl-copy saknas", file=sys.stderr)
+        return 1
+    subprocess.run(["wl-copy"], input=url.encode(), check=False)
+    print(url)
     return 0
 
 
@@ -972,7 +1011,68 @@ def cmd_selftest():
             st = json.loads(r.read())
         check("status har running/url/qr_ok", all(k in st for k in ("running", "url", "qr_ok")))
         check("status-url bär token", token in st["url"], st["url"])
+        check("QR-koden skapas (qrencode via stdin)", st["qr_ok"] is True)
         check("status har active-nyckeln (None när inget pågår)", st.get("active") is None, str(st.get("active")))
+
+        # Token får aldrig hamna i en process kommandorad (argv) — en annan lokal
+        # användare kan läsa den ur processlistan. Provet fångar arg-versionen av
+        # generate_qr genom att spionera på subprocess.run, med QR- och URL-filerna
+        # omdirigerade till provets egen katalog så inget rörs i skarp drift.
+        saved_paths = (globals()["QR_PATH"], globals()["URL_FILE"])
+        globals()["QR_PATH"] = os.path.join(tmp, "qr-test.png")
+        globals()["URL_FILE"] = os.path.join(tmp, "url-test")
+        seen = {"cmd": [], "input": None}
+        real_run = subprocess.run
+
+        def spy(cmd, **kw):
+            seen["cmd"] = list(cmd)
+            seen["input"] = kw.get("input")
+            return real_run(cmd, **kw)
+
+        try:
+            subprocess.run = spy
+            try:
+                qr_ok = generate_qr("http://10.0.0.9:5380/t/HEMLIG-TOKEN/")
+            finally:
+                subprocess.run = real_run
+        finally:
+            globals()["QR_PATH"], globals()["URL_FILE"] = saved_paths
+        joined = " ".join(seen["cmd"])
+        check("QR skapas utan token i argv", qr_ok and "HEMLIG-TOKEN" not in joined,
+              "argv: " + joined)
+        check("  ... URL:en går på stdin", seen["input"] == b"http://10.0.0.9:5380/t/HEMLIG-TOKEN/",
+              repr(seen["input"]))
+
+        # Samma skydd för kopieringen: wl-copy ska få URL:en på stdin, aldrig i argv.
+        saved_token_file = globals()["TOKEN_FILE"]
+        globals()["TOKEN_FILE"] = os.path.join(tmp, "sling", "token")
+        globals()["_TOKEN"] = ""
+        seen_copy = {"cmd": [], "input": None}
+        real_copy_run = subprocess.run
+
+        class FakeDone:
+            returncode = 0
+
+        def spy_copy(cmd, **kw):
+            seen_copy["cmd"] = list(cmd)
+            seen_copy["input"] = kw.get("input")
+            return FakeDone()
+
+        try:
+            subprocess.run = spy_copy
+            try:
+                rc = cmd_copy()
+            finally:
+                subprocess.run = real_copy_run
+        finally:
+            globals()["TOKEN_FILE"] = saved_token_file
+            globals()["_TOKEN"] = ""
+        joined_copy = " ".join(seen_copy["cmd"])
+        check("kopieringen går via stdin, inte argv",
+              rc == 0 and joined_copy == "wl-copy" and token not in joined_copy, "argv: " + joined_copy)
+        check("  ... och bär hela token-URL:en",
+              (seen_copy["input"] or b"").decode().endswith("/t/%s/" % token),
+              "%d byte på stdin" % len(seen_copy["input"] or b""))
 
         # Förloppsindikatorn mäts mitt i en överföring. Kroppen skickas i bitar med
         # paus, så servern står kvar i läsningen och 'active' går att se — till
@@ -1069,12 +1169,14 @@ def main():
         sys.exit(cmd_open())
     elif action == "send":
         sys.exit(cmd_send(sys.argv[2:]))
+    elif action == "copy":
+        sys.exit(cmd_copy(sys.argv[2] if len(sys.argv) > 2 else None))
     elif action == "send-pick":
         sys.exit(cmd_send_pick())
     elif action == "selftest":
         sys.exit(cmd_selftest())
     else:
-        print("Usage: omarchy-sling [server | start | stop | status | open | send <fil...> | send-pick | selftest]")
+        print("Usage: omarchy-sling [server | start | stop | status | open | send <fil...> | send-pick | copy [mdns] | selftest]")
         sys.exit(2)
 
 

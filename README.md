@@ -5,7 +5,7 @@ Sling files between your smartphone (iPhone or Android) and your Linux PC with *
 
 ![Sling Preview](./preview.png)
 
-Current version: `1.2.0`.
+Current version: `1.2.1`.
 
 ---
 
@@ -36,7 +36,7 @@ Current version: `1.2.0`.
 
 Only `qrencode` is required; the rest degrade gracefully — the panel reports what is missing (`omarchy-sling status` → `"qr_ok": false`) instead of showing a blank square. The daemon itself is Python 3 standard library only.
 
-Verify a build at any time — `selftest` starts its own server on a spare port in a scratch directory and runs **24 checks**: files of four sizes uploaded and compared byte for byte, the token gate (403), the size cap (413), duplicate names, and that a running transfer is visible through both the server's `/status` and the CLI the panel polls:
+Verify a build at any time — `selftest` starts its own server on a spare port in a scratch directory and runs **29 checks**: files of four sizes uploaded and compared byte for byte, the token gate (403), the size cap (413), duplicate names, and that a running transfer is visible through both the server's `/status` and the CLI the panel polls:
 
 ```bash
 omarchy-sling selftest
@@ -50,7 +50,8 @@ omarchy-sling selftest
 omarchy plugin add https://github.com/alexwest1981/sling.git --enable
 ```
 
-The CLI lives in `bin/omarchy-sling`; put it on your `PATH`:
+The widget runs the CLI that ships beside it (`bin/omarchy-sling` inside the plugin folder), so
+nothing needs to be on your `PATH`. For terminal use, symlink it:
 
 ```bash
 ln -s ~/.config/omarchy/plugins/io.github.alexwest1981.sling/bin/omarchy-sling ~/.local/bin/omarchy-sling
@@ -95,9 +96,10 @@ omarchy-sling start                  # start the server, print the token URL
 omarchy-sling status                 # JSON: running, url, mdns_url, qr_ok, active, queues
 omarchy-sling send ~/Pictures/a.jpg  # queue files for the phone (symlinked)
 omarchy-sling send-pick              # queue files via a file picker
+omarchy-sling copy [mdns]            # put the token URL in the clipboard (wm-agnostic stdin, never argv)
 omarchy-sling open                   # open the Received folder
 omarchy-sling stop                   # stop now (SIGTERM, then SIGKILL)
-omarchy-sling selftest               # the 24 checks above
+omarchy-sling selftest               # the 29 checks above
 ```
 
 `status` reports the running transfer under `active` (direction, file name, bytes, total, percentage and speed), read from the server itself — the same values the panel draws.
@@ -118,13 +120,15 @@ Traffic is plain HTTP (no TLS) — anyone able to sniff your Wi-Fi can see file 
 
 Uploads are streamed straight to disk with a bounded buffer (a 150 MB file costs about 0.6 MB of resident memory, measured), filenames are HTML-escaped so a crafted name cannot inject script into the phone's page, and downloads are sent with an RFC 5987 encoded `Content-Disposition` so a filename cannot inject headers.
 
+**The token never appears in a process argument list.** Another local account can read `ps` output, so the URL — which carries the token — goes to `qrencode` on stdin, and clipboard copies pipe it to `wl-copy` instead of passing it as an argument. Notifications carry only a file *count*, never file names. The token file is `0600` inside a `0700` directory, the server log is `0600` for the same reason (it names received files), and `selftest` asserts the stdin-not-argv rule for both the QR code and the clipboard.
+
 ---
 
 ## 🗑️ Removal
 
 ```bash
 omarchy plugin remove io.github.alexwest1981.sling
-rm -f ~/.local/bin/omarchy-sling
+rm -f ~/.local/bin/omarchy-sling              # only if you made the symlink
 rm -rf ~/Downloads/Sling ~/.local/state/sling    # received files, send queue and the log
 ```
 
@@ -144,7 +148,7 @@ The neon palette: electric cyan `#00f0ff` for the reticle around the QR code, th
 * **AP/Client Isolation:** Some guest Wi-Fi networks have "Client Isolation" enabled, which prevents local devices from talking to each other. Use your standard home/office Wi-Fi.
 * **Nothing happens when the QR is scanned:** read the log — `~/.local/state/sling/server.log`. It records the bind, the QR result, every rejected upload and every broken transfer.
 * **Missing QR code:** `qrencode` is not installed; `omarchy-sling status` reports `"qr_ok": false`.
-* **The dock stays on "Ready" during a transfer:** the panel reads the transfer from the server through `omarchy-sling status`; check that the CLI on your `PATH` is this repository's (`readlink -f "$(command -v omarchy-sling)"`).
+* **The dock stays on "Ready" during a transfer:** the panel reads the transfer from the server through the CLI next to the widget — check that `bin/omarchy-sling` exists in the plugin folder and is executable (`omarchy-sling status` from a terminal should print the same `active` the panel shows).
 * **Port already in use:** another instance is running (`omarchy-sling stop`, then start again). Starting when one already runs is a no-op, not an error.
 * **Storage Location:** Received files are saved in `~/Downloads/Sling/Received/`, files waiting for the phone in `~/Downloads/Sling/Send/`.
 

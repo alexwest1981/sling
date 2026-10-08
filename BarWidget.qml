@@ -14,6 +14,10 @@ BarWidget {
   readonly property color neonCyan: "#00f0ff"
   readonly property color neonMagenta: "#ff007f"
 
+  // CLI:n hittas på sin plats i pluginmappen — ingen PATH-symlänk behövs, och
+  // token hamnar aldrig i argv (den går på stdin till wl-copy/qrencode).
+  readonly property string cliPath: String(Qt.resolvedUrl("./bin/omarchy-sling")).replace("file://", "")
+
   property bool serverRunning: false
   property bool qrOk: false
   property string serverUrl: "http://127.0.0.1:5380"
@@ -172,7 +176,7 @@ BarWidget {
   // ---------------------------------------------------------------------------
   Process {
     id: statusProc
-    command: ["omarchy-sling", "status"]
+    command: [root.cliPath, "status"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -206,9 +210,17 @@ BarWidget {
     }
   }
 
-  function runSling(action) {
-    Quickshell.execDetached(["omarchy-sling", action])
+  function runSling() {
+    var cmd = [root.cliPath].concat(Array.prototype.slice.call(arguments))
+    Quickshell.execDetached(cmd)
     statusTimer.restart()
+  }
+
+  // Kopieringen görs av CLI:t: URL:en (med token) går på stdin till wl-copy, så den
+  // syns varken i argv eller hänger på att en QML-process stänger sin pipe (mätt).
+  function copyUrl(which) {
+    root.runSling("copy", which)
+    if (root.bar) root.bar.showTooltip(root, root.str.copied)
   }
 
   // ---------------------------------------------------------------------------
@@ -429,8 +441,7 @@ BarWidget {
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
               onClicked: {
-                Quickshell.execDetached(["wl-copy", root.serverUrl])
-                if (root.bar) root.bar.showTooltip(root, root.str.copied)
+                root.copyUrl("")
               }
             }
           }
@@ -465,8 +476,7 @@ BarWidget {
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
               onClicked: {
-                Quickshell.execDetached(["wl-copy", root.mdnsUrl])
-                if (root.bar) root.bar.showTooltip(root, root.str.copied)
+                root.copyUrl("mdns")
               }
             }
           }
