@@ -9,11 +9,14 @@ BarWidget {
   moduleName: "custom.omadrop"
 
   property bool serverRunning: false
+  property bool qrOk: false
   property string serverUrl: "http://127.0.0.1:5380"
+  property string mdnsUrl: ""
   property string localIp: "127.0.0.1"
   property var recentFiles: []
+  property var sendFiles: []
   property bool popupOpen: false
-  property string qrPath: "/tmp/omadrop-qr.png"
+  property string qrPath: ""
   property int refreshTrigger: 0
 
   // ---------------------------------------------------------------------------
@@ -29,6 +32,9 @@ BarWidget {
       btn_open: "📁 Open folder",
       btn_stop: "🛑 Stop",
       btn_start: "▶ Start",
+      btn_send: "📤 Send file…",
+      waiting: "waiting to be fetched",
+      hint_start: "Press Start to show the QR code",
       same_wifi: "Same Wi-Fi required"
     },
     sv: {
@@ -40,6 +46,9 @@ BarWidget {
       btn_open: "📁 Öppna mapp",
       btn_stop: "🛑 Stäng av",
       btn_start: "▶ Starta",
+      btn_send: "📤 Skicka fil…",
+      waiting: "väntar att hämtas",
+      hint_start: "Tryck Starta för att visa QR-koden",
       same_wifi: "Kräver samma Wi-Fi"
     },
     nl: {
@@ -51,6 +60,9 @@ BarWidget {
       btn_open: "📁 Map openen",
       btn_stop: "🛑 Stoppen",
       btn_start: "▶ Starten",
+      btn_send: "📤 Bestand sturen…",
+      waiting: "wacht om opgehaald te worden",
+      hint_start: "Druk op Starten voor de QR-code",
       same_wifi: "Vereist dezelfde Wi-Fi"
     },
     ja: {
@@ -62,6 +74,9 @@ BarWidget {
       btn_open: "📁 フォルダを開く",
       btn_stop: "🛑 停止",
       btn_start: "▶ 開始",
+      btn_send: "📤 ファイルを送信…",
+      waiting: "取得待ち",
+      hint_start: "開始を押すとQRコードを表示します",
       same_wifi: "同じWi-Fi接続が必要です"
     },
     de: {
@@ -73,6 +88,9 @@ BarWidget {
       btn_open: "📁 Ordner öffnen",
       btn_stop: "🛑 Beenden",
       btn_start: "▶ Starten",
+      btn_send: "📤 Datei senden…",
+      waiting: "warten auf Abruf",
+      hint_start: "Start drücken, um den QR-Code zu zeigen",
       same_wifi: "Gleiches WLAN erforderlich"
     },
     fr: {
@@ -84,6 +102,9 @@ BarWidget {
       btn_open: "📁 Ouvrir le dossier",
       btn_stop: "🛑 Arrêter",
       btn_start: "▶ Démarrer",
+      btn_send: "📤 Envoyer un fichier…",
+      waiting: "en attente de téléchargement",
+      hint_start: "Appuyez sur Démarrer pour afficher le QR",
       same_wifi: "Même Wi-Fi requis"
     },
     es: {
@@ -95,6 +116,9 @@ BarWidget {
       btn_open: "📁 Abrir carpeta",
       btn_stop: "🛑 Detener",
       btn_start: "▶ Iniciar",
+      btn_send: "📤 Enviar archivo…",
+      waiting: "esperando descarga",
+      hint_start: "Pulsa Iniciar para ver el código QR",
       same_wifi: "Misma red Wi-Fi requerida"
     },
     zh: {
@@ -106,6 +130,9 @@ BarWidget {
       btn_open: "📁 打开文件夹",
       btn_stop: "🛑 停止",
       btn_start: "▶ 启动",
+      btn_send: "📤 发送文件…",
+      waiting: "等待获取",
+      hint_start: "点击启动显示二维码",
       same_wifi: "需要连接到同一 Wi-Fi"
     }
   })
@@ -124,7 +151,9 @@ BarWidget {
   implicitHeight: button.implicitHeight
 
   // ---------------------------------------------------------------------------
-  // 1. Status Poller
+  // 1. Status Poller — tät bara medan panelen är öppen. Mätt: en körning kostar
+  //    ~47 ms och startar en python-process; 1,5 s dygnet runt blev 0,8 CPU-
+  //    timmar per dygn i onödan.
   // ---------------------------------------------------------------------------
   Process {
     id: statusProc
@@ -135,19 +164,24 @@ BarWidget {
         try {
           var data = JSON.parse(text.trim())
           root.serverRunning = (data.running === true)
+          root.qrOk = (data.qr_ok === true)
           root.serverUrl = data.url || ""
+          root.mdnsUrl = data.mdns_url || ""
           root.localIp = data.ip || ""
           root.recentFiles = data.recent_files || []
-          root.qrPath = data.qr_path || "/tmp/omadrop-qr.png"
+          root.sendFiles = data.send_files || []
+          root.qrPath = data.qr_path || ""
           root.refreshTrigger += 1
-        } catch (e) {}
+        } catch (e) {
+          console.warn("OmaDrop: status JSON not readable: " + e)
+        }
       }
     }
   }
 
   Timer {
     id: statusTimer
-    interval: 1500
+    interval: root.popupOpen ? 1500 : 10000
     running: true
     repeat: true
     triggeredOnStart: true
@@ -213,7 +247,7 @@ BarWidget {
             text: "󰄡"
             color: Color.accent
             font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.displayMedium
+            font.pixelSize: Style.font.display
           }
         }
 
@@ -238,7 +272,7 @@ BarWidget {
         }
       }
 
-      // QR Code Container Card
+      // QR Code Container Card — QR bara när den finns, annars en ledtråd
       BorderSurface {
         width: parent.width
         height: Style.space(230)
@@ -257,6 +291,7 @@ BarWidget {
             height: Style.space(160)
             radius: Style.space(10)
             color: "#ffffff"
+            visible: root.serverRunning && root.qrOk
 
             Image {
               id: qrImg
@@ -265,15 +300,25 @@ BarWidget {
               height: Style.space(146)
               fillMode: Image.PreserveAspectFit
               cache: false
-              source: root.qrPath !== "" ? "file://" + root.qrPath + "?v=" + root.refreshTrigger : ""
+              source: (root.serverRunning && root.qrOk && root.qrPath !== "")
+                      ? "file://" + root.qrPath + "?v=" + root.refreshTrigger : ""
               smooth: false
             }
+          }
+
+          Text {
+            visible: !(root.serverRunning && root.qrOk)
+            text: root.str.hint_start
+            color: Qt.darker(root.bar.foreground, 1.3)
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.bodySmall
           }
 
           // URL Text Pill (Click to copy)
           Rectangle {
             anchors.horizontalCenter: parent.horizontalCenter
-            width: urlRow.implicitWidth + Style.space(16)
+            visible: root.serverRunning
+            width: Math.min(urlRow.implicitWidth + Style.space(16), parent.width)
             height: Style.space(24)
             radius: Style.space(12)
             color: copyMouse.containsMouse ? Style.normalFillFor(root.bar.foreground, Color.accent) : Qt.rgba(1, 1, 1, 0.06)
@@ -289,6 +334,9 @@ BarWidget {
                 font.family: root.bar.fontFamily
                 font.pixelSize: Style.font.caption
                 font.bold: true
+                elide: Text.ElideMiddle
+                // Token-URL:en är lång — håll pillret innanför panelens bredd
+                width: Math.min(implicitWidth, parent.parent.width - Style.space(16))
               }
             }
 
@@ -303,7 +351,53 @@ BarWidget {
               }
             }
           }
+
+          // Adressen att minnas — samma sida, namn i stället för IP
+          Rectangle {
+            anchors.horizontalCenter: parent.horizontalCenter
+            visible: root.serverRunning && root.mdnsUrl !== ""
+            width: Math.min(mdnsRow.implicitWidth + Style.space(16), parent.width)
+            height: Style.space(22)
+            radius: Style.space(11)
+            color: mdnsMouse.containsMouse ? Style.normalFillFor(root.bar.foreground, Color.accent) : Qt.rgba(1, 1, 1, 0.04)
+
+            Row {
+              id: mdnsRow
+              anchors.centerIn: parent
+              spacing: Style.space(5)
+
+              Text {
+                text: "🏠 " + root.mdnsUrl
+                color: Qt.darker(root.bar.foreground, 1.2)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideMiddle
+                width: Math.min(implicitWidth, parent.parent.width - Style.space(16))
+              }
+            }
+
+            MouseArea {
+              id: mdnsMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: {
+                Quickshell.execDetached(["wl-copy", root.mdnsUrl])
+                if (root.bar) root.bar.showTooltip(root, root.str.copied)
+              }
+            }
+          }
         }
+      }
+
+      // Skicka-kön: filer i Send/ som väntar på telefonen
+      Text {
+        width: parent.width
+        visible: root.sendFiles.length > 0
+        text: "📤 " + root.sendFiles.length + " " + root.str.waiting
+        color: Qt.darker(root.bar.foreground, 1.2)
+        font.family: root.bar.fontFamily
+        font.pixelSize: Style.font.caption
       }
 
       // Recent Files Section
@@ -365,7 +459,7 @@ BarWidget {
         }
       }
 
-      // Action Buttons Row
+      // Action Buttons: mapp + skicka, sedan start/stopp över hela bredden
       Row {
         width: parent.width
         spacing: Style.space(8)
@@ -381,16 +475,25 @@ BarWidget {
 
         Button {
           width: (parent.width - Style.space(8)) / 2
-          text: root.serverRunning ? root.str.btn_stop : root.str.btn_start
-          foreground: root.serverRunning ? "#f7768e" : "#9ece6a"
+          text: root.str.btn_send
+          foreground: root.bar.foreground
           horizontalPadding: Style.spacing.controlPaddingX
           verticalPadding: Style.spacing.controlPaddingY
-          onClicked: {
-            if (root.serverRunning) {
-              root.runOmaDrop("stop")
-            } else {
-              root.runOmaDrop("start")
-            }
+          onClicked: root.runOmaDrop("send-pick")
+        }
+      }
+
+      Button {
+        width: parent.width
+        text: root.serverRunning ? root.str.btn_stop : root.str.btn_start
+        foreground: root.serverRunning ? "#f7768e" : "#9ece6a"
+        horizontalPadding: Style.spacing.controlPaddingX
+        verticalPadding: Style.spacing.controlPaddingY
+        onClicked: {
+          if (root.serverRunning) {
+            root.runOmaDrop("stop")
+          } else {
+            root.runOmaDrop("start")
           }
         }
       }

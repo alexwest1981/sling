@@ -1,32 +1,55 @@
 #!/usr/bin/env python3
 # ==============================================================================
 # OmaDrop (Omarchy File Drop Daemon & CLI)
-# Multi-language / i18n Edition
 # Part of OmaDrop - https://github.com/alexwest1981/OmaDrop
+#
+# Säkerhetsmodell: servern lyssnar på LAN:et, men varje förfrågan måste bära en
+# token i sökvägen (/t/<token>/...). Token skapas vid start, byts varje gång och
+# följer med i QR-koden. Servern avväpnar sig själv efter OMADROP_IDLE_TIMEOUT
+# sekunder utan trafik.
 # ==============================================================================
 
-import os
-import sys
-import re
-import time
-import socket
+import html
 import json
-import urllib.parse
+import os
+import re
+import secrets
+import shutil
+import signal
+import socket
 import subprocess
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import sys
+import threading
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-PORT = 5380
-BASE_DIR = os.path.expanduser("~/Downloads/OmaDrop")
+VERSION = "1.1.0"
+PORT = int(os.environ.get("OMADROP_PORT", 5380))
+IDLE_TIMEOUT = int(os.environ.get("OMADROP_IDLE_TIMEOUT", 900))
+MAX_UPLOAD = int(os.environ.get("OMADROP_MAX_UPLOAD", 2 * 1024**3))
+MDNS_NAME = os.environ.get("OMADROP_MDNS_NAME", "omadrop")
+
+BASE_DIR = os.path.expanduser(os.environ.get("OMADROP_BASE_DIR", "~/Downloads/OmaDrop"))
 RECEIVED_DIR = os.path.join(BASE_DIR, "Received")
 SEND_DIR = os.path.join(BASE_DIR, "Send")
-QR_PATH = "/tmp/omadrop-qr.png"
-PID_FILE = "/tmp/omadrop.pid"
 
-os.makedirs(RECEIVED_DIR, exist_ok=True)
-os.makedirs(SEND_DIR, exist_ok=True)
+STATE_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "omadrop")
+QR_PATH = os.path.join(STATE_DIR, "qr.png")
+URL_FILE = os.path.join(STATE_DIR, "url")
+PID_FILE = os.path.join(STATE_DIR, "pid")
+TOKEN_FILE = os.path.join(STATE_DIR, "token")
+LOG_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "omadrop")
+LOG_PATH = os.path.join(LOG_DIR, "server.log")
+
+for _d in (RECEIVED_DIR, SEND_DIR, STATE_DIR, LOG_DIR):
+    os.makedirs(_d, exist_ok=True)
+
+LAST_ACTIVITY = {"t": time.monotonic()}
+_TOKEN = ""
 
 # ------------------------------------------------------------------------------
-# Server-side Notifications i18n
+# Notiser i18n (datorns språk)
 # ------------------------------------------------------------------------------
 NOTIF_STRINGS = {
     "en": {"received_single": "📥 OmaDrop: 1 new file received", "received_multi": "📥 OmaDrop: {count} new files received"},
@@ -36,176 +59,279 @@ NOTIF_STRINGS = {
     "de": {"received_single": "📥 OmaDrop: 1 neue Datei empfangen", "received_multi": "📥 OmaDrop: {count} neue Dateien empfangen"},
     "fr": {"received_single": "📥 OmaDrop: 1 nouveau fichier reçu", "received_multi": "📥 OmaDrop: {count} nouveaux fichiers reçus"},
     "es": {"received_single": "📥 OmaDrop: 1 archivo nuevo recibido", "received_multi": "📥 OmaDrop: {count} archivos nuevos recibidos"},
-    "zh": {"received_single": "📥 OmaDrop: 收到 1 个新文件", "received_multi": "📥 OmaDrop: 收到 {count} 个新文件"}
+    "zh": {"received_single": "📥 OmaDrop: 收到 1 个新文件", "received_multi": "📥 OmaDrop: 收到 {count} 个新文件"},
 }
+
 
 def get_system_lang():
     lang_env = os.environ.get("LANG", "en_US.UTF-8").split(".")[0].split("_")[0].lower()
     return lang_env if lang_env in NOTIF_STRINGS else "en"
 
+
+def log(msg):
+    try:
+        with open(LOG_PATH, "a") as fh:
+            fh.write("%s  %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------------------------
+# Nätverk och filer
+# ------------------------------------------------------------------------------
 def get_local_ip():
+    """IP:t telefonen ska använda.
+
+    UDP-knepet ger rätt interface utan att skicka ett paket. Saknas default-route
+    (isolerat nät, hotspot utan gateway) faller vi tillbaka på första globala
+    IPv4-adressen — gamla koden gav då 127.0.0.1, vilket pekar på telefonen själv
+    och gör QR-koden verkningslös.
+    """
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("1.1.1.1", 80))
         ip = s.getsockname()[0]
         s.close()
-        return ip
+        if ip and not ip.startswith("127."):
+            return ip
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope", "global"],
+                             capture_output=True, text=True, timeout=5).stdout
+        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out)
+        if m:
+            return m.group(1)
     except Exception:
-        return "127.0.0.1"
+        pass
+    return "127.0.0.1"
+
+
+def port_open(host="127.0.0.1", port=None):
+    s = socket.socket()
+    s.settimeout(0.3)
+    try:
+        return s.connect_ex((host, port or PORT)) == 0
+    finally:
+        s.close()
+
+
+def server_url(token, host=None):
+    return "http://%s:%d/t/%s/" % (host or get_local_ip(), PORT, token)
+
+
+def read_token():
+    try:
+        with open(TOKEN_FILE) as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def current_token():
+    """Token för den här processen. Cachas: skulle filen försvinna mitt i körningen
+    ska servern inte plötsligt släppa igenom vilken sökväg som helst."""
+    global _TOKEN
+    if not _TOKEN:
+        _TOKEN = read_token()
+    return _TOKEN
+
+
+def human_size(size):
+    return "%.1f KB" % (size / 1024) if size < 1024 * 1024 else "%.1f MB" % (size / (1024 * 1024))
+
+
+def unique_path(directory, filename):
+    dest = os.path.join(directory, filename)
+    base, ext = os.path.splitext(filename)
+    counter = 1
+    while os.path.exists(dest):
+        dest = os.path.join(directory, "%s_%d%s" % (base, counter, ext))
+        counter += 1
+    return dest
+
+
+def list_files(directory, limit=None):
+    if not os.path.isdir(directory):
+        return []
+    names = [f for f in os.listdir(directory) if os.path.isfile(os.path.join(directory, f))]
+    names.sort(key=lambda f: os.path.getmtime(os.path.join(directory, f)), reverse=True)
+    if limit:
+        names = names[:limit]
+    return [{"name": f, "size": human_size(os.path.getsize(os.path.join(directory, f)))} for f in names]
+
 
 def generate_qr(url):
+    """True om QR-filen finns och är för aktuell URL. Aldrig tyst: skälet hamnar i
+    loggen och som qr_ok=False i status."""
     try:
-        subprocess.run(["qrencode", "-s", "6", "-m", "2", "-o", QR_PATH, url], check=False)
-    except Exception:
-        pass
+        with open(URL_FILE) as fh:
+            current = fh.read().strip()
+    except OSError:
+        current = ""
+    if current == url and os.path.exists(QR_PATH):
+        return True
+    if not shutil.which("qrencode"):
+        log("qrencode saknas — ingen QR-kod kan skapas")
+        return False
+    r = subprocess.run(["qrencode", "-s", "6", "-m", "2", "-o", QR_PATH, url],
+                       capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.exists(QR_PATH):
+        log("qrencode misslyckades: " + (r.stderr or "").strip())
+        return False
+    with open(URL_FILE, "w") as fh:
+        fh.write(url)
+    return True
 
-def parse_multipart(rfile, content_type, content_length, save_dir):
-    m = re.search(r'boundary=(.+)', content_type)
+
+def start_mdns():
+    """Publicerar omadrop.local → den här datorn, en adress att minnas som
+    överlever att DHCP byter IP. QR-koden använder ändå IP:t: Android löser
+    inte .local pålitligt, och en QR som inte fungerar är värre än ett IP."""
+    if not shutil.which("avahi-publish-service"):
+        return None
+    try:
+        p = subprocess.Popen(["avahi-publish-service", "-s", MDNS_NAME, "_http._tcp", str(PORT)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+    time.sleep(0.4)
+    return p if p.poll() is None else None
+
+
+# ------------------------------------------------------------------------------
+# Multipart som strömmar till disk
+# ------------------------------------------------------------------------------
+def stream_multipart(rfile, content_type, content_length, save_dir):
+    """Läser multipart-kroppen i bitar och skriver varje fil direkt till disk.
+
+    Mätt: den tidigare varianten (rfile.read(hela kroppen) + split(boundary)) tog
+    540 MB RSS för en 150 MB-fil — en 1 GB-video hade krävt ~3,5 GB.
+
+    ponytail: bufferten behåller len(gräns)+4 byte mellan varven, vilket räcker för
+    att en gräns som delas av två läsningar inte hamnar i filen. Ingen Range-
+    uppladdning och ingen omsändning — kroppen kommer i en POST.
+    """
+    m = re.search(r"boundary=(.+)", content_type)
     if not m:
         return []
-    boundary = m.group(1).strip('"\'').encode('utf-8')
-    delimiter = b'--' + boundary
+    delim = b"--" + m.group(1).strip("\"'").encode()
+    keep = len(delim) + 4
 
-    saved_files = []
-    data = rfile.read(content_length)
-    parts = data.split(delimiter)
+    buf = b""
+    remaining = content_length
+    out = None                      # (sökväg, filhandtag)
+    saved = []
+    state = "preamble"              # preamble -> headers -> data -> headers ...
 
-    for part in parts:
-        if not part or part.startswith(b'--') or b'\r\n\r\n' not in part:
-            continue
-        
-        header_bytes, body = part.split(b'\r\n\r\n', 1)
-        if body.endswith(b'\r\n'):
-            body = body[:-2]
+    def close_part():
+        nonlocal out
+        if out:
+            out[1].close()
+            saved.append(os.path.basename(out[0]))
+            out = None
 
-        headers_str = header_bytes.decode('utf-8', errors='replace')
-        fn_match = re.search(r'filename="([^"]+)"', headers_str)
-        if fn_match:
-            filename = os.path.basename(fn_match.group(1))
-            if not filename:
-                continue
-            
-            dest_path = os.path.join(save_dir, filename)
-            counter = 1
-            base, ext = os.path.splitext(filename)
-            while os.path.exists(dest_path):
-                dest_path = os.path.join(save_dir, f"{base}_{counter}{ext}")
-                counter += 1
+    while remaining > 0:
+        chunk = rfile.read(min(65536, remaining))
+        if not chunk:
+            break
+        remaining -= len(chunk)
+        buf += chunk
 
-            with open(dest_path, "wb") as f:
-                f.write(body)
-            saved_files.append(os.path.basename(dest_path))
+        while True:
+            if state == "preamble":
+                i = buf.find(delim)
+                if i < 0:
+                    # Skräp före första gränsen kan vara hur stort som helst.
+                    if len(buf) > 1_000_000:
+                        buf = buf[-keep:]
+                    break
+                buf = buf[i + len(delim):]
+                if buf.startswith(b"--"):
+                    return saved
+                state = "headers"
 
-    return saved_files
+            elif state == "headers":
+                # Rubrikerna för den del vi står i ligger först i bufferten. De får
+                # aldrig kastas: gjorde man det tappades filen (mätt — 2 av 4 filer
+                # försvann när nästa dels rubriker trimmades bort).
+                j = buf.find(b"\r\n\r\n")
+                if j < 0:
+                    if len(buf) > 1_000_000:
+                        return saved
+                    break
+                headers = buf[:j].decode("utf-8", "replace")
+                buf = buf[j + 4:]
+                fn = re.search(r'filename="([^"]*)"', headers)
+                name = os.path.basename(fn.group(1)) if fn else ""
+                if name:
+                    path = unique_path(save_dir, name)
+                    out = (path, open(path, "wb"))
+                state = "data"
 
-class OmaDropHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass
+            else:                                    # data
+                i = buf.find(delim)
+                if i < 0:
+                    if len(buf) > keep:
+                        data, buf = buf[:-keep], buf[-keep:]
+                        if out:
+                            out[1].write(data)
+                    break
+                data = buf[:i]
+                if data.endswith(b"\r\n"):
+                    data = data[:-2]
+                if out:
+                    out[1].write(data)
+                buf = buf[i + len(delim):]
+                close_part()
+                if buf.startswith(b"--"):
+                    return saved          # slutgräns
+                state = "headers"          # nästa dels rubriker ligger först i bufferten
 
-    def do_HEAD(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
+    close_part()
+    return saved
 
-    def do_GET(self):
-        parsed = urllib.parse.urlparse(self.path)
-        if parsed.path == "/" or parsed.path == "/index.html":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
 
-            send_files = []
-            if os.path.exists(SEND_DIR):
-                for f in os.listdir(SEND_DIR):
-                    full_p = os.path.join(SEND_DIR, f)
-                    if os.path.isfile(full_p):
-                        sz = os.path.getsize(full_p)
-                        sz_str = f"{sz / 1024:.1f} KB" if sz < 1024*1024 else f"{sz / (1024*1024):.1f} MB"
-                        send_files.append({"name": f, "size": sz_str})
-
-            html = f"""<!DOCTYPE html>
+# ------------------------------------------------------------------------------
+# Webbsidan (mobilen). Alla länkar är relativa så token-prefixet följer med.
+# ------------------------------------------------------------------------------
+PAGE = """<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>OmaDrop 🚀</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OmaDrop</title>
     <style>
-        :root {{
-            --bg: #1a1b26;
-            --card-bg: #24283b;
-            --accent: #7aa2f7;
-            --accent-glow: rgba(122, 162, 247, 0.3);
-            --success: #9ece6a;
-            --fg: #c0caf5;
-            --fg-dim: #7982a9;
-            --border: #414868;
-        }}
-        * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
-        body {{
-            background: var(--bg);
-            color: var(--fg);
-            min-height: 100vh;
-            padding: 24px 16px;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-        }}
-        .container {{ width: 100%; max-width: 460px; }}
-        header {{ text-align: center; margin-bottom: 24px; }}
-        h1 {{ font-size: 26px; color: #fff; font-weight: 700; display: flex; align-items: center; justify-content: center; gap: 8px; }}
-        p.subtitle {{ color: var(--fg-dim); font-size: 14px; margin-top: 6px; }}
-        .card {{
-            background: var(--card-bg);
-            border: 1px solid var(--border);
-            border-radius: 18px;
-            padding: 22px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.35);
-            margin-bottom: 20px;
-        }}
-        .dropzone {{
-            border: 2px dashed var(--accent);
-            border-radius: 14px;
-            padding: 36px 16px;
-            text-align: center;
-            background: rgba(122, 162, 247, 0.06);
-            cursor: pointer;
-            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-        }}
-        .dropzone:active {{ background: var(--accent-glow); transform: scale(0.98); }}
-        .dropzone-icon {{ font-size: 52px; margin-bottom: 12px; }}
-        .dropzone-text {{ font-size: 17px; font-weight: 700; color: #fff; }}
-        .dropzone-sub {{ font-size: 13px; color: var(--fg-dim); margin-top: 6px; }}
-        #fileInput {{ display: none; }}
-        #progressContainer {{ display: none; margin-top: 20px; }}
-        .progress-bar-bg {{ background: var(--border); height: 12px; border-radius: 6px; overflow: hidden; }}
-        .progress-bar-fill {{ background: var(--accent); height: 100%; width: 0%; transition: width 0.1s linear; }}
-        .progress-status {{ font-size: 14px; color: #fff; margin-top: 10px; text-align: center; font-weight: 600; }}
-        .file-item {{
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            background: rgba(0,0,0,0.25);
-            padding: 12px 14px;
-            border-radius: 10px;
-            margin-bottom: 8px;
-            font-size: 14px;
-            border: 1px solid rgba(255,255,255,0.05);
-        }}
-        .file-info {{ display: flex; flex-direction: column; overflow: hidden; max-width: 240px; }}
-        .file-name {{ color: #fff; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-        .file-size {{ color: var(--fg-dim); font-size: 12px; margin-top: 2px; }}
-        .dl-btn {{
-            background: var(--accent);
-            color: #1a1b26;
-            padding: 8px 14px;
-            border-radius: 8px;
-            font-size: 13px;
-            font-weight: 700;
-            text-decoration: none;
-            flex-shrink: 0;
-        }}
+        :root {{ --bg:#1a1b26; --card:#24283b; --accent:#7aa2f7; --accent-glow:rgba(122,162,247,.3);
+                 --success:#9ece6a; --fg:#c0caf5; --fg-dim:#7982a9; --border:#414868; }}
+        * {{ box-sizing:border-box; margin:0; padding:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }}
+        body {{ background:var(--bg); color:var(--fg); min-height:100vh; padding:24px 16px;
+                display:flex; flex-direction:column; align-items:center; }}
+        .container {{ width:100%; max-width:460px; }}
+        header {{ text-align:center; margin-bottom:24px; }}
+        h1 {{ font-size:26px; color:#fff; font-weight:700; display:flex; align-items:center; justify-content:center; gap:8px; }}
+        p.subtitle {{ color:var(--fg-dim); font-size:14px; margin-top:6px; }}
+        .card {{ background:var(--card); border:1px solid var(--border); border-radius:18px; padding:22px;
+                 box-shadow:0 10px 30px rgba(0,0,0,.35); margin-bottom:20px; }}
+        .dropzone {{ border:2px dashed var(--accent); border-radius:14px; padding:36px 16px; text-align:center;
+                     background:rgba(122,162,247,.06); cursor:pointer; transition:all .2s cubic-bezier(.4,0,.2,1); }}
+        .dropzone:active {{ background:var(--accent-glow); transform:scale(.98); }}
+        .dropzone-icon {{ font-size:52px; margin-bottom:12px; }}
+        .dropzone-text {{ font-size:17px; font-weight:700; color:#fff; }}
+        .dropzone-sub {{ font-size:13px; color:var(--fg-dim); margin-top:6px; }}
+        #fileInput {{ display:none; }}
+        #progressContainer {{ display:none; margin-top:20px; }}
+        .progress-bar-bg {{ background:var(--border); height:12px; border-radius:6px; overflow:hidden; }}
+        .progress-bar-fill {{ background:var(--accent); height:100%; width:0%; transition:width .1s linear; }}
+        .progress-status {{ font-size:14px; color:#fff; margin-top:10px; text-align:center; font-weight:600; }}
+        .file-item {{ display:flex; align-items:center; justify-content:space-between; background:rgba(0,0,0,.25);
+                      padding:12px 14px; border-radius:10px; margin-bottom:8px; font-size:14px;
+                      border:1px solid rgba(255,255,255,.05); }}
+        .file-info {{ display:flex; flex-direction:column; overflow:hidden; max-width:240px; }}
+        .file-name {{ color:#fff; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+        .file-size {{ color:var(--fg-dim); font-size:12px; margin-top:2px; }}
+        .dl-btn {{ background:var(--accent); color:#1a1b26; padding:8px 14px; border-radius:8px; font-size:13px;
+                   font-weight:700; text-decoration:none; flex-shrink:0; }}
     </style>
 </head>
 <body>
@@ -216,7 +342,7 @@ class OmaDropHandler(BaseHTTPRequestHandler):
         </header>
 
         <div class="card">
-            <h2 id="t-send-title" style="font-size: 17px; margin-bottom: 14px; color: #fff; display: flex; align-items: center; gap: 6px;">📱 Send to PC</h2>
+            <h2 id="t-send-title" style="font-size:17px;margin-bottom:14px;color:#fff;display:flex;align-items:center;gap:6px;">📱 Send to PC</h2>
             <form id="uploadForm" enctype="multipart/form-data">
                 <input type="file" id="fileInput" name="files" multiple>
                 <div class="dropzone" onclick="document.getElementById('fileInput').click()">
@@ -227,131 +353,60 @@ class OmaDropHandler(BaseHTTPRequestHandler):
             </form>
 
             <div id="progressContainer">
-                <div class="progress-bar-bg">
-                    <div class="progress-bar-fill" id="progressBar"></div>
-                </div>
+                <div class="progress-bar-bg"><div class="progress-bar-fill" id="progressBar"></div></div>
                 <div class="progress-status" id="progressStatus">Starting...</div>
             </div>
         </div>
 
-        <div class="card" id="downloadCard" style="{'display: block;' if send_files else 'display: none;'}">
-            <h2 id="t-get-title" style="font-size: 17px; margin-bottom: 14px; color: #fff; display: flex; align-items: center; gap: 6px;">💻 Get from PC</h2>
-            <div>
-                {"".join([f'''<div class="file-item"><div class="file-info"><span class="file-name">📄 {f["name"]}</span><span class="file-size">{f["size"]}</span></div><a href="/download/{urllib.parse.quote(f["name"])}" class="dl-btn t-dl-btn" download>Download</a></div>''' for f in send_files])}
-            </div>
+        <div class="card" id="downloadCard" style="{download_display}">
+            <h2 id="t-get-title" style="font-size:17px;margin-bottom:14px;color:#fff;display:flex;align-items:center;gap:6px;">💻 Get from PC</h2>
+            <div>{file_rows}</div>
         </div>
     </div>
 
     <script>
         const I18N = {{
-            en: {{
-                subtitle: "Fast wireless file sharing with your PC",
-                send_title: "📱 Send to PC",
-                drop_title: "Select photos or files",
-                drop_sub: "Tap here to upload",
-                starting: "Starting transfer...",
-                uploading: "Uploading...",
-                done: "✅ Done! Files saved on PC.",
-                error: "❌ Upload failed.",
-                conn_error: "❌ Connection error.",
-                get_title: "💻 Get from PC",
-                download: "Download"
-            }},
-            sv: {{
-                subtitle: "Snabb trådlös fildelning direkt till din dator",
-                send_title: "📱 Skicka till datorn",
-                drop_title: "Välj foton eller filer",
-                drop_sub: "Tryck här för att ladda upp",
-                starting: "Startar överföring...",
-                uploading: "Laddar upp...",
-                done: "✅ Klart! Filerna är sparade på datorn.",
-                error: "❌ Fel vid uppladdning.",
-                conn_error: "❌ Anslutningsfel.",
-                get_title: "💻 Hämta från datorn",
-                download: "Ladda ner"
-            }},
-            nl: {{
-                subtitle: "Snelle draadloze bestandsoverdracht naar je pc",
-                send_title: "📱 Naar pc sturen",
-                drop_title: "Selecteer foto's of bestanden",
-                drop_sub: "Tik hier om te uploaden",
-                starting: "Overdracht starten...",
-                uploading: "Uploaden...",
-                done: "✅ Klaar! Bestanden opgeslagen op pc.",
-                error: "❌ Uploaden mislukt.",
-                conn_error: "❌ Verbindingsfout.",
-                get_title: "💻 Ophalen van pc",
-                download: "Downloaden"
-            }},
-            ja: {{
-                subtitle: "PCとスマホ間で素早くファイル転送",
-                send_title: "📱 PCへ送信",
-                drop_title: "写真またはファイルを選択",
-                drop_sub: "タップしてアップロード",
-                starting: "転送を開始しています...",
-                uploading: "アップロード中...",
-                done: "✅ 完了！PCに保存されました。",
-                error: "❌ アップロードに失敗しました。",
-                conn_error: "❌ 接続エラー。",
-                get_title: "💻 PCから受信",
-                download: "ダウンロード"
-            }},
-            de: {{
-                subtitle: "Schnelle drahtlose Dateiübertragung zu deinem PC",
-                send_title: "📱 An PC senden",
-                drop_title: "Fotos oder Dateien auswählen",
-                drop_sub: "Tippen zum Hochladen",
-                starting: "Übertragung startet...",
-                uploading: "Wird hochgeladen...",
-                done: "✅ Fertig! Dateien auf dem PC gespeichert.",
-                error: "❌ Fehler beim Hochladen.",
-                conn_error: "❌ Verbindungsfehler.",
-                get_title: "💻 Vom PC herunterladen",
-                download: "Herunterladen"
-            }},
-            fr: {{
-                subtitle: "Partage de fichiers rapide et sans fil avec votre PC",
-                send_title: "📱 Envoyer au PC",
-                drop_title: "Sélectionner des photos ou fichiers",
-                drop_sub: "Appuyez ici pour téléverser",
-                starting: "Démarrage du transfert...",
-                uploading: "Téléversement...",
-                done: "✅ Terminé ! Fichiers enregistrés sur le PC.",
-                error: "❌ Échec du téléversement.",
-                conn_error: "❌ Erreur de connexion.",
-                get_title: "💻 Télécharger depuis le PC",
-                download: "Télécharger"
-            }},
-            es: {{
-                subtitle: "Transferencia rápida de archivos con tu PC",
-                send_title: "📱 Enviar a la PC",
-                drop_title: "Seleccionar fotos o archivos",
-                drop_sub: "Toca aquí para subir",
-                starting: "Iniciando transferencia...",
-                uploading: "Subiendo...",
-                done: "✅ ¡Listo! Archivos guardados en la PC.",
-                error: "❌ Error al subir.",
-                conn_error: "❌ Error de conexión.",
-                get_title: "💻 Descargar desde la PC",
-                download: "Descargar"
-            }},
-            zh: {{
-                subtitle: "在手机和电脑之间快速无线传输文件",
-                send_title: "📱 发送到电脑",
-                drop_title: "选择照片或文件",
-                drop_sub: "点击此处上传",
-                starting: "正在开始传输...",
-                uploading: "正在上传...",
-                done: "✅ 完成！文件已保存到电脑。",
-                error: "❌ 上传失败。",
-                conn_error: "❌ 连接错误。",
-                get_title: "💻 从电脑下载",
-                download: "下载"
-            }}
+            en: {{ subtitle:"Fast wireless file sharing with your PC", send_title:"📱 Send to PC", drop_title:"Select photos or files",
+                   drop_sub:"Tap here to upload", starting:"Starting transfer...", uploading:"Uploading...",
+                   done:"✅ Done! Files saved on PC.", error:"❌ Upload failed.", too_big:"❌ Too large — split the file or raise the limit.",
+                   conn_error:"❌ Connection error.", get_title:"💻 Get from PC", download:"Download" }},
+            sv: {{ subtitle:"Snabb trådlös fildelning direkt till din dator", send_title:"📱 Skicka till datorn",
+                   drop_title:"Välj foton eller filer", drop_sub:"Tryck här för att ladda upp", starting:"Startar överföring...",
+                   uploading:"Laddar upp...", done:"✅ Klart! Filerna är sparade på datorn.", error:"❌ Fel vid uppladdning.",
+                   too_big:"❌ För stor fil — dela den eller höj gränsen.", conn_error:"❌ Anslutningsfel.",
+                   get_title:"💻 Hämta från datorn", download:"Ladda ner" }},
+            nl: {{ subtitle:"Snelle draadloze bestandsoverdracht naar je pc", send_title:"📱 Naar pc sturen",
+                   drop_title:"Selecteer foto's of bestanden", drop_sub:"Tik hier om te uploaden", starting:"Overdracht starten...",
+                   uploading:"Uploaden...", done:"✅ Klaar! Bestanden opgeslagen op pc.", error:"❌ Uploaden mislukt.",
+                   too_big:"❌ Te groot — splits het bestand of verhoog de limiet.", conn_error:"❌ Verbindingsfout.",
+                   get_title:"💻 Ophalen van pc", download:"Downloaden" }},
+            ja: {{ subtitle:"PCとスマホ間で素早くファイル転送", send_title:"📱 PCへ送信", drop_title:"写真またはファイルを選択",
+                   drop_sub:"タップしてアップロード", starting:"転送を開始しています...", uploading:"アップロード中...",
+                   done:"✅ 完了！PCに保存されました。", error:"❌ アップロードに失敗しました。",
+                   too_big:"❌ ファイルが大きすぎます。分割するか上限を上げてください。", conn_error:"❌ 接続エラー。",
+                   get_title:"💻 PCから受信", download:"ダウンロード" }},
+            de: {{ subtitle:"Schnelle drahtlose Dateiübertragung zu deinem PC", send_title:"📱 An PC senden",
+                   drop_title:"Fotos oder Dateien auswählen", drop_sub:"Tippen zum Hochladen", starting:"Übertragung startet...",
+                   uploading:"Wird hochgeladen...", done:"✅ Fertig! Dateien auf dem PC gespeichert.", error:"❌ Fehler beim Hochladen.",
+                   too_big:"❌ Zu groß — Datei teilen oder Limit erhöhen.", conn_error:"❌ Verbindungsfehler.",
+                   get_title:"💻 Vom PC herunterladen", download:"Herunterladen" }},
+            fr: {{ subtitle:"Partage de fichiers rapide et sans fil avec votre PC", send_title:"📱 Envoyer au PC",
+                   drop_title:"Sélectionner des photos ou fichiers", drop_sub:"Appuyez ici pour téléverser",
+                   starting:"Démarrage du transfert...", uploading:"Téléversement...", done:"✅ Terminé ! Fichiers enregistrés sur le PC.",
+                   error:"❌ Échec du téléversement.", too_big:"❌ Trop volumineux — divisez le fichier ou augmentez la limite.",
+                   conn_error:"❌ Erreur de connexion.", get_title:"💻 Télécharger depuis le PC", download:"Télécharger" }},
+            es: {{ subtitle:"Transferencia rápida de archivos con tu PC", send_title:"📱 Enviar a la PC",
+                   drop_title:"Seleccionar fotos o archivos", drop_sub:"Toca aquí para subir", starting:"Iniciando transferencia...",
+                   uploading:"Subiendo...", done:"✅ ¡Listo! Archivos guardados en la PC.", error:"❌ Error al subir.",
+                   too_big:"❌ Demasiado grande — divide el archivo o sube el límite.", conn_error:"❌ Error de conexión.",
+                   get_title:"💻 Descargar desde la PC", download:"Descargar" }},
+            zh: {{ subtitle:"在手机和电脑之间快速无线传输文件", send_title:"📱 发送到电脑", drop_title:"选择照片或文件",
+                   drop_sub:"点击此处上传", starting:"正在开始传输...", uploading:"正在上传...", done:"✅ 完成！文件已保存到电脑。",
+                   error:"❌ 上传失败。", too_big:"❌ 文件太大——请拆分文件或提高上限。", conn_error:"❌ 连接错误。",
+                   get_title:"💻 从电脑下载", download:"下载" }}
         }};
 
-        // Detect mobile user browser/system language
-        const userLang = (navigator.language || navigator.userLanguage || 'en').slice(0, 2).toLowerCase();
+        const userLang = (navigator.language || 'en').slice(0, 2).toLowerCase();
         const t = I18N[userLang] || I18N.en;
 
         document.getElementById('t-subtitle').innerText = t.subtitle;
@@ -374,9 +429,7 @@ class OmaDropHandler(BaseHTTPRequestHandler):
 
         function uploadFiles(files) {{
             const formData = new FormData();
-            for (let i = 0; i < files.length; i++) {{
-                formData.append('files', files[i]);
-            }}
+            for (let i = 0; i < files.length; i++) formData.append('files', files[i]);
 
             progressContainer.style.display = 'block';
             progressBar.style.width = '0%';
@@ -384,7 +437,7 @@ class OmaDropHandler(BaseHTTPRequestHandler):
             progressStatus.innerText = t.starting;
 
             const xhr = new XMLHttpRequest();
-            xhr.open('POST', '/upload', true);
+            xhr.open('POST', 'upload', true);       // relativ: behåller token-prefixet
 
             xhr.upload.onprogress = (e) => {{
                 if (e.lengthComputable) {{
@@ -404,194 +457,464 @@ class OmaDropHandler(BaseHTTPRequestHandler):
                         progressContainer.style.display = 'none';
                         progressBar.style.background = 'var(--accent)';
                     }}, 4000);
+                }} else if (xhr.status === 413) {{
+                    progressStatus.innerText = t.too_big;
                 }} else {{
                     progressStatus.innerText = t.error;
                 }}
             }};
 
-            xhr.onerror = () => {{
-                progressStatus.innerText = t.conn_error;
-            }};
-
+            xhr.onerror = () => {{ progressStatus.innerText = t.conn_error; }};
             xhr.send(formData);
         }}
     </script>
 </body>
 </html>"""
-            self.wfile.write(html.encode("utf-8"))
 
-        elif parsed.path.startswith("/download/"):
-            filename = urllib.parse.unquote(parsed.path[len("/download/"):])
-            safe_name = os.path.basename(filename)
-            filepath = os.path.join(SEND_DIR, safe_name)
-            if os.path.exists(filepath):
+
+class OmaDropHandler(BaseHTTPRequestHandler):
+    server_version = "OmaDrop/" + VERSION
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _resolve(self):
+        """Sökvägen efter token-prefixet, annars None (→ 403)."""
+        path = urllib.parse.urlparse(self.path).path
+        prefix = "/t/%s" % current_token()
+        if current_token() and path.startswith(prefix):
+            LAST_ACTIVITY["t"] = time.monotonic()
+            return path[len(prefix):] or "/"
+        return None
+
+    def _send(self, code, body=b"", ctype="text/plain; charset=utf-8", extra=None):
+        self.send_response(code)
+        if body:
+            self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for key, value in (extra or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def _no_token(self):
+        self._send(403, ("OmaDrop is running. Use the link or QR code from the bar panel.\n"
+                         "OmaDrop körs. Använd länken eller QR-koden i panelen.\n").encode())
+
+    def do_HEAD(self):
+        rest = self._resolve()
+        if rest is None:
+            self._no_token()
+        else:
+            self._send(200)
+
+    def do_GET(self):
+        rest = self._resolve()
+        if rest is None:
+            self._no_token()
+            return
+
+        if rest in ("/", "/index.html"):
+            send_files = list_files(SEND_DIR)
+            rows = "".join(
+                '<div class="file-item"><div class="file-info"><span class="file-name">📄 %s</span>'
+                '<span class="file-size">%s</span></div>'
+                '<a href="download/%s" class="dl-btn t-dl-btn" download>Download</a></div>'
+                % (html.escape(f["name"]), f["size"], urllib.parse.quote(f["name"]))
+                for f in send_files)
+            page = PAGE.format(download_display="display: block;" if send_files else "display: none;",
+                               file_rows=rows).encode()
+            self._send(200, page, "text/html; charset=utf-8", {"Cache-Control": "no-store"})
+
+        elif rest == "/status":
+            self._send(200, json.dumps(status_dict(True)).encode(), "application/json")
+
+        elif rest.startswith("/download/"):
+            name = os.path.basename(urllib.parse.unquote(rest[len("/download/"):]))
+            filepath = os.path.join(SEND_DIR, name)
+            if name and os.path.isfile(filepath):
                 self.send_response(200)
                 self.send_header("Content-Type", "application/octet-stream")
-                self.send_header("Content-Disposition", f'attachment; filename="{safe_name}"')
+                # RFC 5987-formen klarar icke-ASCII och kan inte injicera rubriker.
+                self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + urllib.parse.quote(name))
                 self.send_header("Content-Length", str(os.path.getsize(filepath)))
                 self.end_headers()
-                with open(filepath, "rb") as f:
-                    while chunk := f.read(65536):
+                with open(filepath, "rb") as fh:
+                    while chunk := fh.read(65536):
                         self.wfile.write(chunk)
             else:
-                self.send_response(404)
-                self.end_headers()
+                self._send(404)
 
-        elif parsed.path == "/status":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            recent = []
-            if os.path.exists(RECEIVED_DIR):
-                files = [f for f in os.listdir(RECEIVED_DIR) if os.path.isfile(os.path.join(RECEIVED_DIR, f))]
-                files.sort(key=lambda x: os.path.getmtime(os.path.join(RECEIVED_DIR, x)), reverse=True)
-                for f in files[:5]:
-                    sz = os.path.getsize(os.path.join(RECEIVED_DIR, f))
-                    sz_str = f"{sz / 1024:.1f} KB" if sz < 1024*1024 else f"{sz / (1024*1024):.1f} MB"
-                    recent.append({"name": f, "size": sz_str})
-
-            data = {
-                "ok": True,
-                "ip": get_local_ip(),
-                "port": PORT,
-                "url": f"http://{get_local_ip()}:{PORT}",
-                "qr_path": QR_PATH,
-                "received_dir": RECEIVED_DIR,
-                "recent_files": recent
-            }
-            self.wfile.write(json.dumps(data).encode("utf-8"))
         else:
-            self.send_response(404)
-            self.end_headers()
+            self._send(404)
 
     def do_POST(self):
-        if self.path == "/upload":
-            content_type = self.headers.get('Content-Type', '')
-            content_length = int(self.headers.get('Content-Length', 0))
-
-            if not content_type.startswith('multipart/form-data') or content_length == 0:
-                self.send_response(400)
-                self.end_headers()
-                return
-
-            saved = parse_multipart(self.rfile, content_type, content_length, RECEIVED_DIR)
-
-            if saved:
-                count = len(saved)
-                lang = get_system_lang()
-                tmpl = NOTIF_STRINGS[lang]["received_single"] if count == 1 else NOTIF_STRINGS[lang]["received_multi"]
-                summary = tmpl.format(count=count)
-                body = ", ".join(saved[:3])
-                if count > 3:
-                    body += f" (+{count - 3})"
-                try:
-                    subprocess.run(["notify-send", summary, body, "--icon=folder-download", "-a", "OmaDrop"], check=False)
-                except Exception:
-                    pass
-
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"ok": True, "saved": saved}).encode("utf-8"))
-
-def cmd_server():
-    ip = get_local_ip()
-    url = f"http://{ip}:{PORT}"
-    generate_qr(url)
-    with open(PID_FILE, "w") as f:
-        f.write(str(os.getpid()))
-    
-    server = HTTPServer(("0.0.0.0", PORT), OmaDropHandler)
-    server.serve_forever()
-
-def cmd_start():
-    if os.path.exists(PID_FILE):
-        try:
-            with open(PID_FILE) as f:
-                pid = int(f.read().strip())
-            os.kill(pid, 0)
-            print("OmaDrop is already running.")
+        rest = self._resolve()
+        if rest is None:
+            self._no_token()
             return
-        except Exception:
-            pass
-    
-    cmd = [sys.executable, os.path.abspath(__file__), "server"]
-    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    time.sleep(0.3)
-    print("OmaDrop started.")
-
-def cmd_stop():
-    if os.path.exists(PID_FILE):
-        try:
-            with open(PID_FILE) as f:
-                pid = int(f.read().strip())
-            os.kill(pid, 9)
-            os.remove(PID_FILE)
-            print("OmaDrop stopped.")
+        if rest != "/upload":
+            self._send(404)
             return
-        except Exception:
-            pass
-    subprocess.run(["pkill", "-f", "omarchy-omadrop server"], check=False)
-    print("OmaDrop stopped.")
 
-def cmd_status():
-    ip = get_local_ip()
-    url = f"http://{ip}:{PORT}"
-    is_running = False
-    
-    if os.path.exists(PID_FILE):
+        ctype = self.headers.get("Content-Type", "")
         try:
-            with open(PID_FILE) as f:
-                pid = int(f.read().strip())
-            os.kill(pid, 0)
-            is_running = True
-        except Exception:
-            is_running = False
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            length = 0
+        if not ctype.startswith("multipart/form-data") or length == 0:
+            self._send(400)
+            return
+        if length > MAX_UPLOAD:
+            log("avvisade uppladdning på %d byte (tak %d)" % (length, MAX_UPLOAD))
+            # Läs och släng kroppen (upp till 8 MB) INNAN svaret skickas: annars
+            # får klienten en bruten anslutning mitt i sin egen uppladdning i
+            # stället för beskedet. Sedan stängs anslutningen — resten av kroppen
+            # skulle annars tolkas som nästa förfrågan.
+            self.close_connection = True
+            drain = min(length, 8 * 1024 * 1024)
+            while drain > 0:
+                chunk = self.rfile.read(min(65536, drain))
+                if not chunk:
+                    break
+                drain -= len(chunk)
+            self._send(413, json.dumps({"ok": False, "error": "too large"}).encode(), "application/json")
+            return
 
-    if not is_running:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.2)
-        if s.connect_ex(('127.0.0.1', PORT)) == 0:
-            is_running = True
-        s.close()
+        try:
+            saved = stream_multipart(self.rfile, ctype, length, RECEIVED_DIR)
+        except OSError as exc:
+            log("uppladdning misslyckades: %s" % exc)
+            self._send(500, json.dumps({"ok": False, "error": str(exc)}).encode(), "application/json")
+            return
 
-    if is_running and not os.path.exists(QR_PATH):
-        generate_qr(url)
+        if saved:
+            key = "received_single" if len(saved) == 1 else "received_multi"
+            summary = NOTIF_STRINGS[get_system_lang()][key].format(count=len(saved))
+            body = ", ".join(saved[:3]) + (" (+%d)" % (len(saved) - 3) if len(saved) > 3 else "")
+            subprocess.run(["notify-send", summary, body, "--icon=folder-download", "-a", "OmaDrop"], check=False)
+            log("tog emot %d fil(er): %s" % (len(saved), body))
 
-    recent = []
-    if os.path.exists(RECEIVED_DIR):
-        files = [f for f in os.listdir(RECEIVED_DIR) if os.path.isfile(os.path.join(RECEIVED_DIR, f))]
-        files.sort(key=lambda x: os.path.getmtime(os.path.join(RECEIVED_DIR, x)), reverse=True)
-        for f in files[:5]:
-            sz = os.path.getsize(os.path.join(RECEIVED_DIR, f))
-            sz_str = f"{sz / 1024:.1f} KB" if sz < 1024*1024 else f"{sz / (1024*1024):.1f} MB"
-            recent.append({"name": f, "size": sz_str})
+        self._send(200, json.dumps({"ok": True, "saved": saved}).encode(), "application/json")
 
-    data = {
-        "running": is_running,
+
+class OmaDropServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def server_bind(self):
+        """Hoppar över BaseHTTPServer.server_bind, som gör en omvänd DNS-lookup
+        (socket.getfqdn) innan socketen börjar lyssna. Mätt: 5,01 s på den här
+        maskinen — och eftersom PID-filen skrevs först visade panelen "running"
+        medan ingenting svarade."""
+        import socketserver
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "omadrop"
+        self.server_port = self.server_address[1]
+
+
+# ------------------------------------------------------------------------------
+# Status — en källa för CLI och HTTP
+# ------------------------------------------------------------------------------
+def status_dict(running=None):
+    token = current_token() or read_token()
+    ip = get_local_ip()
+    if running is None:
+        running = port_open()
+    if running:
+        generate_qr(server_url(token, ip))
+    return {
+        "ok": True,
+        "version": VERSION,
+        "running": bool(running),
         "ip": ip,
         "port": PORT,
-        "url": url,
+        "url": server_url(token, ip),
+        "mdns_url": "http://%s.local:%d/t/%s/" % (MDNS_NAME, PORT, token),
+        "idle_timeout": IDLE_TIMEOUT,
+        "max_upload": MAX_UPLOAD,
         "qr_path": QR_PATH,
+        "qr_ok": os.path.exists(QR_PATH),
         "received_dir": RECEIVED_DIR,
-        "recent_files": recent
+        "send_dir": SEND_DIR,
+        "recent_files": list_files(RECEIVED_DIR, 5),
+        "send_files": list_files(SEND_DIR),
     }
-    print(json.dumps(data))
+
+
+# ------------------------------------------------------------------------------
+# Kommandon
+# ------------------------------------------------------------------------------
+def cmd_server():
+    global _TOKEN
+    _TOKEN = secrets.token_urlsafe(9)
+    with open(TOKEN_FILE, "w") as fh:
+        fh.write(_TOKEN)
+    os.chmod(TOKEN_FILE, 0o600)
+    url = server_url(_TOKEN)
+    with open(PID_FILE, "w") as fh:
+        fh.write(str(os.getpid()))
+
+    mdns = start_mdns()
+    server = OmaDropServer(("0.0.0.0", PORT), OmaDropHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    qr_ok = generate_qr(url)
+    log("lyssnar på 0.0.0.0:%d, mDNS=%s, qr_ok=%s, token=%s..." % (PORT, bool(mdns), qr_ok, _TOKEN[:4]))
+
+    def bye(*_):
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, bye)
+    signal.signal(signal.SIGINT, bye)
+    try:
+        while time.monotonic() - LAST_ACTIVITY["t"] <= IDLE_TIMEOUT:
+            time.sleep(2)
+        log("ingen trafik på %ds — avväpnar" % IDLE_TIMEOUT)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        server.shutdown()
+        server.server_close()
+        if mdns:
+            mdns.terminate()
+        for path in (PID_FILE, TOKEN_FILE):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def cmd_start():
+    if port_open():
+        print("OmaDrop is already running.")
+        return 0
+    with open(LOG_PATH, "a") as logfh:
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "server"],
+                         stdout=logfh, stderr=logfh, start_new_session=True)
+    for _ in range(50):                     # upp till ~5 s
+        if port_open():
+            print("OmaDrop started: %s" % server_url(read_token()))
+            return 0
+        time.sleep(0.1)
+    print("OmaDrop did not come up — se %s" % LOG_PATH, file=sys.stderr)
+    return 1
+
+
+def cmd_stop():
+    pid = None
+    try:
+        with open(PID_FILE) as fh:
+            pid = int(fh.read().strip())
+    except (OSError, ValueError):
+        pass
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            for _ in range(30):
+                if not port_open():
+                    break
+                time.sleep(0.1)
+        except ProcessLookupError:
+            pass
+    if port_open():
+        subprocess.run(["pkill", "-f", "omarchy-omadrop server"], check=False)
+    print("OmaDrop stopped.")
+    return 0
+
+
+def cmd_status():
+    print(json.dumps(status_dict()))
+    return 0
+
 
 def cmd_open():
     subprocess.run(["xdg-open", RECEIVED_DIR], check=False)
+    return 0
 
-if __name__ == "__main__":
+
+def cmd_send(paths):
+    """Lägger filer i Send/. Symlänk i första hand — en 2 GB-video ska inte
+    behöva finnas i två kopior för att kunna hämtas."""
+    count = 0
+    for raw in paths:
+        src = os.path.abspath(os.path.expanduser(raw))
+        if not os.path.isfile(src):
+            print("hoppar över %s (ingen fil)" % src, file=sys.stderr)
+            continue
+        dest = unique_path(SEND_DIR, os.path.basename(src))
+        try:
+            os.symlink(src, dest)
+        except OSError:
+            shutil.copy2(src, dest)
+        print(dest)
+        count += 1
+    return 0 if count else 1
+
+
+def cmd_send_pick():
+    if not shutil.which("zenity"):
+        print("zenity saknas — öppnar Send-mappen i stället", file=sys.stderr)
+        subprocess.run(["xdg-open", SEND_DIR], check=False)
+        return 1
+    r = subprocess.run(["zenity", "--file-selection", "--multiple", "--separator=\n",
+                        "--title=OmaDrop: skicka till telefonen"],
+                       capture_output=True, text=True)
+    paths = [line for line in r.stdout.splitlines() if line.strip()]
+    return cmd_send(paths) if paths else 1
+
+
+# ------------------------------------------------------------------------------
+# Egenkontroll: parsern, token-grinden, taket
+# ------------------------------------------------------------------------------
+def cmd_selftest():
+    """Kör en server på egen port i en städad miljö och verifierar att filer kommer
+    fram byte-identiska, att saknad/fel token nekas och att storlekstaket håller."""
+    import tempfile
+    import urllib.error
+    import urllib.request
+
+    tmp = tempfile.mkdtemp(prefix="omadrop-selftest-")
+    port = int(os.environ.get("OMADROP_SELFTEST_PORT", "5381"))
+    env = dict(os.environ,
+               OMADROP_PORT=str(port),
+               OMADROP_BASE_DIR=tmp,
+               OMADROP_IDLE_TIMEOUT="60",
+               OMADROP_MAX_UPLOAD="2097152",            # 2 MB i provet
+               XDG_RUNTIME_DIR=tmp,
+               OMADROP_MDNS_NAME="omadrop-test")
+    proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), "server"],
+                            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    failures = []
+    counted = {"n": 0}
+
+    def check(name, cond, detail=""):
+        counted["n"] += 1
+        print("  %-50s %s%s" % (name, "OK" if cond else "MISSLYCKADES", ("  " + detail) if detail else ""))
+        if not cond:
+            failures.append(name)
+
+    def multipart(files):
+        b = "----omadroptest"
+        out = b""
+        for name, data in files:
+            out += ("--%s\r\nContent-Disposition: form-data; name=\"files\"; filename=\"%s\"\r\n"
+                    "Content-Type: application/octet-stream\r\n\r\n" % (b, name)).encode() + data + b"\r\n"
+        return out + ("--%s--\r\n" % b).encode(), "multipart/form-data; boundary=" + b
+
+    def post(files, token):
+        body, ctype = multipart(files)
+        req = urllib.request.Request("http://127.0.0.1:%d/t/%s/upload" % (port, token), data=body,
+                                     headers={"Content-Type": ctype}, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, {}
+
+    try:
+        for _ in range(80):
+            try:
+                urllib.request.urlopen("http://127.0.0.1:%d/" % port, timeout=1)
+                break
+            except urllib.error.HTTPError:
+                break
+            except Exception:
+                time.sleep(0.1)
+
+        with open(os.path.join(tmp, "omadrop", "token")) as fh:
+            token = fh.read().strip()
+
+        payloads = [
+            ("tom.bin", b""),
+            ("liten.bin", bytes(range(256)) * 400),                       # 100 kB
+            ("stor.bin", os.urandom(900_000)),                            # 900 kB, många buffertvarv
+        ]
+        code, reply = post(payloads, token)
+        check("uppladdning svarar 200", code == 200, "fick %s" % code)
+        check("tre filer rapporterade", len(reply.get("saved", [])) == 3, "fick %s" % reply.get("saved"))
+        for name, data in payloads:
+            path = os.path.join(tmp, "Received", name)
+            ok = os.path.isfile(path) and open(path, "rb").read() == data
+            check("byte-identisk: %s (%d B)" % (name, len(data)), ok)
+            if not ok:
+                break
+
+        # En kropp som innehåller själva gränssträngen går inte att representera i
+        # multipart (avsändaren ska välja en gräns som inte förekommer i innehållet).
+        # Det som måste hålla är att parsern inte tappar bort de följande delarna.
+        fake = b"\r\n----omadroptest\r\n" * 5000
+        real = os.urandom(200_000)
+        code, reply = post([("gräns.bin", fake), ("efter.bin", real)], token)
+        check("del efter gräns-kropp kommer fram", os.path.isfile(os.path.join(tmp, "Received", "efter.bin")),
+              "fick %s" % reply.get("saved"))
+        efter = os.path.join(tmp, "Received", "efter.bin")
+        check("  ... och är byte-identisk", os.path.isfile(efter) and open(efter, "rb").read() == real)
+        gran = os.path.join(tmp, "Received", "gräns.bin")
+        check("  gräns-kroppen är en trunkerad prefix",
+              os.path.isfile(gran) and fake.startswith(open(gran, "rb").read()))
+
+        code, reply = post([("liten.bin", b"x")], token)
+        check("dubblettnamn får _1", "liten_1.bin" in reply.get("saved", []), "fick %s" % reply.get("saved"))
+
+        code, _ = post([("tak.bin", b"y" * (3 * 1024 * 1024))], token)
+        check("för stor uppladdning nekas (413)", code == 413, "fick %s" % code)
+        check("ingen dellfil av den nekade finns", not os.path.exists(os.path.join(tmp, "Received", "tak.bin")))
+
+        code, _ = post([("x.bin", b"z")], "fel-token")
+        check("fel token nekas (403)", code == 403, "fick %s" % code)
+        try:
+            urllib.request.urlopen("http://127.0.0.1:%d/" % port, timeout=5)
+            check("utan token nekas (403)", False, "släpptes igenom")
+        except urllib.error.HTTPError as e:
+            check("utan token nekas (403)", e.code == 403, "fick %s" % e.code)
+
+        with urllib.request.urlopen("http://127.0.0.1:%d/t/%s/" % (port, token), timeout=5) as r:
+            page = r.read().decode()
+        check("mobilsidan renderas (200)", "OmaDrop" in page)
+
+        with urllib.request.urlopen("http://127.0.0.1:%d/t/%s/status" % (port, token), timeout=5) as r:
+            st = json.loads(r.read())
+        check("status har running/url/qr_ok", all(k in st for k in ("running", "url", "qr_ok")))
+        check("status-url bär token", token in st["url"], st["url"])
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    print("\n%d kontroller, %d misslyckade" % (counted["n"], len(failures)))
+    if failures:
+        print("MISSLYCKADE: " + ", ".join(failures))
+        return 1
+    print("OmaDrop selftest: OK")
+    return 0
+
+
+def main():
     action = sys.argv[1] if len(sys.argv) > 1 else "status"
     if action == "server":
         cmd_server()
     elif action == "start":
-        cmd_start()
+        sys.exit(cmd_start())
     elif action == "stop":
-        cmd_stop()
+        sys.exit(cmd_stop())
     elif action == "status":
-        cmd_status()
+        sys.exit(cmd_status())
     elif action == "open":
-        cmd_open()
+        sys.exit(cmd_open())
+    elif action == "send":
+        sys.exit(cmd_send(sys.argv[2:]))
+    elif action == "send-pick":
+        sys.exit(cmd_send_pick())
+    elif action == "selftest":
+        sys.exit(cmd_selftest())
     else:
-        print("Usage: omarchy-omadrop [server | start | stop | status | open]")
+        print("Usage: omarchy-omadrop [server | start | stop | status | open | send <fil...> | send-pick | selftest]")
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
