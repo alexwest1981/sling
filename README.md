@@ -116,6 +116,18 @@ Uploads are streamed straight to disk with a bounded buffer (a 150 MB file costs
 
 ---
 
+## 🗑️ Removal
+
+```bash
+omarchy plugin remove io.github.alexwest1981.sling
+rm -f ~/.local/bin/omarchy-sling
+rm -rf ~/Downloads/Sling ~/.local/state/sling    # received files, send queue and the log
+```
+
+Nothing else is written outside those paths, so removing them removes the plugin.
+
+---
+
 ## 🎨 Design
 
 The phone's page uses the neon palette: electric cyan `#00f0ff` for the reticle, the progress bar and control accents, hot magenta `#ff007f` for the wordmark, on an obsidian `#0d1117` canvas. The bar panel keeps your bar's own surface colours and uses the neon tones as accents, so it does not fight a light theme.

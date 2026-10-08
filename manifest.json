@@ -15,7 +15,7 @@
   "barWidget": {
     "displayName": "Sling",
     "description": "Instant QR code file drop for phone and PC over local Wi-Fi.",
-    "category": "Utilities",
+    "category": "Productivity",
     "allowMultiple": false,
     "defaultSection": "right"
   }
