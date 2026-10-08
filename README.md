@@ -5,6 +5,8 @@ Sling files between your smartphone (iPhone or Android) and your Linux PC with *
 
 ![Sling Preview](./preview.png)
 
+Current version: `1.2.0`.
+
 ---
 
 ## ✨ Features
@@ -12,7 +14,7 @@ Sling files between your smartphone (iPhone or Android) and your Linux PC with *
 * **📷 Zero Mobile Installation:** Point your regular phone camera at the QR code in the top bar and the transfer portal opens on your local Wi-Fi.
 * **📱 Send from Phone to PC:** Tap to pick photos, videos or documents — files land in `~/Downloads/Sling/Received/`.
 * **💻 Send from PC to Phone:** Put files in `~/Downloads/Sling/Send/`, or press **📤 Send file…** in the panel (file picker), and download them on the phone with one tap. Queued files are symlinked, not copied, so a 2 GB video costs no extra disk.
-* **📊 Live Progress:** Large transfers show a progress bar — in the phone's page *and* in the bar panel (file, percent, MB/s), with the percentage in the bare bar label itself while it runs.
+* **📊 Live Progress:** A transfer dock in the panel shows direction, file name, a large percentage, the filled bar and MB/s while a file moves — and the bar label itself switches to the percentage, so a long transfer is visible without opening anything. The phone's page has its own progress bar during uploads.
 * **🔔 Native Desktop Notifications:** A desktop notification with the file count arrives as soon as transfers complete.
 * **🔐 Token-gated:** Every request must carry a random token in the URL (`/t/<token>/`), created at start and carried by the QR code. Without it the server answers 403 and reveals nothing.
 * **💤 Disarms itself:** The server exits after 15 minutes without traffic (`SLING_IDLE_TIMEOUT`), so leaving it started does not leave a permanent door open.
@@ -32,9 +34,9 @@ Sling files between your smartphone (iPhone or Android) and your Linux PC with *
 | `libnotify` | desktop notifications (optional) | usually already installed |
 | `wl-clipboard` | the copy-link button (optional) | usually already installed |
 
-Only `qrencode` is required; the rest degrade gracefully — the panel reports what is missing (`omarchy-sling status` → `"qr_ok": false`) instead of showing a blank square.
+Only `qrencode` is required; the rest degrade gracefully — the panel reports what is missing (`omarchy-sling status` → `"qr_ok": false`) instead of showing a blank square. The daemon itself is Python 3 standard library only.
 
-Verify a build at any time — it starts its own server on a spare port, uploads test files and checks them byte for byte, then probes the token gate, the size cap and the progress reporting:
+Verify a build at any time — `selftest` starts its own server on a spare port in a scratch directory and runs **24 checks**: files of four sizes uploaded and compared byte for byte, the token gate (403), the size cap (413), duplicate names, and that a running transfer is visible through both the server's `/status` and the CLI the panel polls:
 
 ```bash
 omarchy-sling selftest
@@ -84,7 +86,7 @@ omarchy-restart-shell
 
 ## 🕹️ Usage
 
-**From the panel:** click the bar icon — the server starts, the QR code appears inside the neon reticle, and the panel shows the URL, the `sling.local` address, a live progress bar while a large file is moving, the send queue and the last received files. Buttons: **📁 Open folder**, **📤 Send file…**, **▶ Start / 🛑 Stop**.
+**From the panel:** click the bar icon — the server starts and the QR code appears inside the neon reticle. Below it: the `sling.local` address, the transfer dock (which reads *Ready — waiting for a file* when nothing is moving), the send queue and the last received files. Buttons: **📁 Open folder**, **📤 Send file…**, **▶ Start / 🛑 Stop**.
 
 **From the terminal:**
 
@@ -95,8 +97,10 @@ omarchy-sling send ~/Pictures/a.jpg  # queue files for the phone (symlinked)
 omarchy-sling send-pick              # queue files via a file picker
 omarchy-sling open                   # open the Received folder
 omarchy-sling stop                   # stop now (SIGTERM, then SIGKILL)
-omarchy-sling selftest               # verify parser, token gate, size cap and progress
+omarchy-sling selftest               # the 24 checks above
 ```
+
+`status` reports the running transfer under `active` (direction, file name, bytes, total, percentage and speed), read from the server itself — the same values the panel draws.
 
 Environment overrides: `SLING_PORT` (5380), `SLING_IDLE_TIMEOUT` (900 s), `SLING_MAX_UPLOAD` (2 GiB per request), `SLING_BASE_DIR` (`~/Downloads/Sling`), `SLING_MDNS_NAME` (`sling`).
 
@@ -130,7 +134,7 @@ Nothing else is written outside those paths, so removing them removes the plugin
 
 ## 🎨 Design
 
-The phone's page uses the neon palette: electric cyan `#00f0ff` for the reticle, the progress bar and control accents, hot magenta `#ff007f` for the wordmark, on an obsidian `#0d1117` canvas. The bar panel keeps your bar's own surface colours and uses the neon tones as accents, so it does not fight a light theme.
+The neon palette: electric cyan `#00f0ff` for the reticle around the QR code, the progress bar and the control accents; hot magenta `#ff007f` for the wordmark and the panel icon; obsidian `#0d1117` as the surface. The phone's page and the bar panel share it — the panel keeps your bar's own border and typography, so the widget still belongs in the bar.
 
 ---
 
@@ -138,8 +142,9 @@ The phone's page uses the neon palette: electric cyan `#00f0ff` for the reticle,
 
 * **Same Wi-Fi Network:** Make sure your smartphone and your PC are connected to the same local Wi-Fi router (not mobile data 4G/5G).
 * **AP/Client Isolation:** Some guest Wi-Fi networks have "Client Isolation" enabled, which prevents local devices from talking to each other. Use your standard home/office Wi-Fi.
-* **Nothing happens when the QR is scanned:** read the log — `~/.local/state/sling/server.log`. It records the bind, the QR result and every rejected upload.
+* **Nothing happens when the QR is scanned:** read the log — `~/.local/state/sling/server.log`. It records the bind, the QR result, every rejected upload and every broken transfer.
 * **Missing QR code:** `qrencode` is not installed; `omarchy-sling status` reports `"qr_ok": false`.
+* **The dock stays on "Ready" during a transfer:** the panel reads the transfer from the server through `omarchy-sling status`; check that the CLI on your `PATH` is this repository's (`readlink -f "$(command -v omarchy-sling)"`).
 * **Port already in use:** another instance is running (`omarchy-sling stop`, then start again). Starting when one already runs is a no-op, not an error.
 * **Storage Location:** Received files are saved in `~/Downloads/Sling/Received/`, files waiting for the phone in `~/Downloads/Sling/Send/`.
 
