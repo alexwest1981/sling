@@ -5,7 +5,7 @@ Sling files between your smartphone (iPhone or Android) and your Linux PC with *
 
 ![Sling Preview](./preview.png)
 
-Current version: `1.2.1`.
+Current version: `1.3.0`.
 
 ---
 
@@ -36,7 +36,7 @@ Current version: `1.2.1`.
 
 Only `qrencode` is required; the rest degrade gracefully — the panel reports what is missing (`omarchy-sling status` → `"qr_ok": false`) instead of showing a blank square. The daemon itself is Python 3 standard library only.
 
-Verify a build at any time — `selftest` starts its own server on a spare port in a scratch directory and runs **29 checks**: files of four sizes uploaded and compared byte for byte, the token gate (403), the size cap (413), duplicate names, and that a running transfer is visible through both the server's `/status` and the CLI the panel polls:
+Verify a build at any time — `selftest` starts its own server on a spare port in a scratch directory and runs **37 checks**: files of four sizes uploaded and compared byte for byte, the token gate (403), the size cap (413), duplicate names, queue deduplication and removal (the source file always survives), and that a running transfer is visible through both the server's `/status` and the CLI the panel polls:
 
 ```bash
 omarchy-sling selftest
@@ -87,19 +87,21 @@ omarchy-restart-shell
 
 ## 🕹️ Usage
 
-**From the panel:** click the bar icon — the server starts and the QR code appears inside the neon reticle. Below it: the `sling.local` address, the transfer dock (which reads *Ready — waiting for a file* when nothing is moving), the send queue and the last received files. Buttons: **📁 Open folder**, **📤 Send file…**, **▶ Start / 🛑 Stop**.
+**From the panel:** click the bar icon — the server starts and the QR code appears inside the neon reticle. Below it: the `sling.local` address, the transfer dock (which reads *Ready — waiting for a file* when nothing is moving), the send queue and the last received files. The queue lists the first five files waiting for the phone with a `✕` per file, plus **📁 Open Send folder** and **🗑 Clear all** — a `+ N more…` line opens the folder. Buttons: **📁 Open folder**, **📤 Send file…**, **▶ Start / 🛑 Stop**.
 
 **From the terminal:**
 
 ```bash
 omarchy-sling start                  # start the server, print the token URL
 omarchy-sling status                 # JSON: running, url, mdns_url, qr_ok, active, queues
-omarchy-sling send ~/Pictures/a.jpg  # queue files for the phone (symlinked)
+omarchy-sling send ~/Pictures/a.jpg  # queue files for the phone (symlinked, never twice)
 omarchy-sling send-pick              # queue files via a file picker
+omarchy-sling remove a.jpg           # unlink one file from the queue (the original is untouched)
+omarchy-sling clear                  # empty the whole queue
 omarchy-sling copy [mdns]            # put the token URL in the clipboard (wm-agnostic stdin, never argv)
-omarchy-sling open                   # open the Received folder
+omarchy-sling open [send|received]   # open the Received (default) or Send folder
 omarchy-sling stop                   # stop now (SIGTERM, then SIGKILL)
-omarchy-sling selftest               # the 29 checks above
+omarchy-sling selftest               # the 37 checks above
 ```
 
 `status` reports the running transfer under `active` (direction, file name, bytes, total, percentage and speed), read from the server itself — the same values the panel draws.

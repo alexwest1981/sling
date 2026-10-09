@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.alexwest1981.sling",
   "name": "Sling",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "author": "Alex Weström",
   "license": "MIT",
   "description": "Sling - Zero-App QR file sharing between phone and PC for Omarchy.",

@@ -25,7 +25,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 PORT = int(os.environ.get("SLING_PORT", 5380))
 IDLE_TIMEOUT = int(os.environ.get("SLING_IDLE_TIMEOUT", 900))
 MAX_UPLOAD = int(os.environ.get("SLING_MAX_UPLOAD", 2 * 1024**3))
@@ -300,7 +300,7 @@ def stream_multipart(rfile, content_type, content_length, save_dir, on_progress=
             on_progress(nbytes, name)
 
     while remaining > 0:
-        chunk = rfile.read(min(65536, remaining))
+        chunk = rfile.read(min(262144, remaining))
         if not chunk:
             break
         remaining -= len(chunk)
@@ -554,6 +554,24 @@ class SlingHandler(BaseHTTPRequestHandler):
     server_version = "Sling/" + VERSION
     protocol_version = "HTTP/1.1"
 
+    def setup(self):
+        """Nagle av på serverhållet — mobilen ACK:ar fördröjt, och det sista
+        delsegmentet i en skrivning kunde bli liggande i väntan på det.
+
+        Mätt 2026-10-10, loopback 256 MB, 6 körningar per variant: 64 KB- och
+        256 KB-block ligger båda på ~4,0 GB/s (median 4043 mot 4078 MB/s) — det
+        är CPU-bundet på loopback och ingen mätbar skillnad. Den rapporterade
+        Wi-Fi-strypningen (0,5–1,5 MB/s) går inte att återskapa härifrån, så
+        flaggan står kvar som billig härdning, inte som bevisad fix.
+        SNDBUF/RCVBUF lämnas åt kerneln: autotuning växer förbi 1 MB vid behov,
+        en fast gräns gör det inte.
+        """
+        super().setup()
+        try:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+
     def log_message(self, fmt, *args):
         pass
 
@@ -623,7 +641,7 @@ class SlingHandler(BaseHTTPRequestHandler):
                 start_transfer("down", name, size)
                 try:
                     with open(filepath, "rb") as fh:
-                        while chunk := fh.read(65536):
+                        while chunk := fh.read(262144):   # färre väckningar per byte, mätt lika snabbt som 64 KB
                             self.wfile.write(chunk)
                             bump_transfer(len(chunk))
                 except (BrokenPipeError, ConnectionResetError):
@@ -697,6 +715,7 @@ class SlingHandler(BaseHTTPRequestHandler):
 
 class SlingServer(ThreadingHTTPServer):
     daemon_threads = True
+    request_queue_size = 64          # en telefon öppnar flera anslutningar samtidigt
 
     def server_bind(self):
         """Hoppar över BaseHTTPServer.server_bind, som gör en omvänd DNS-lookup
@@ -842,8 +861,8 @@ def cmd_status():
     return 0
 
 
-def cmd_open():
-    subprocess.run(["xdg-open", RECEIVED_DIR], check=False)
+def cmd_open(which=None):
+    subprocess.run(["xdg-open", SEND_DIR if which == "send" else RECEIVED_DIR], check=False)
     return 0
 
 
@@ -876,7 +895,18 @@ def cmd_send(paths):
         if not os.path.isfile(src):
             print("hoppar över %s (ingen fil)" % src, file=sys.stderr)
             continue
-        dest = unique_path(SEND_DIR, os.path.basename(src))
+        dest = os.path.join(SEND_DIR, os.path.basename(src))
+        if os.path.islink(dest) and not os.path.exists(dest):
+            # Källfilen är borta — länken är död och namnet ledigt igen.
+            os.remove(dest)
+        elif os.path.exists(dest) and os.path.samefile(dest, src):
+            # Samma fil en gång till: kön har den redan, ingen _1-kopia.
+            # (unique_path gjorde förut en ny länk varje gång man skickade om.)
+            print("%s (already in send queue)" % dest)
+            count += 1
+            continue
+        if os.path.exists(dest):
+            dest = unique_path(SEND_DIR, os.path.basename(src))
         try:
             os.symlink(src, dest)
         except OSError:
@@ -884,6 +914,35 @@ def cmd_send(paths):
         print(dest)
         count += 1
     return 0 if count else 1
+
+
+def cmd_remove(names):
+    """Tar bort filer ur Send/-kön. Rör aldrig källfilen: kön består av länkar,
+    och os.remove tar länken. Ett namn, inte en sökväg — basename hindrar '../'."""
+    count = 0
+    for raw in names:
+        name = os.path.basename(raw)
+        try:
+            os.remove(os.path.join(SEND_DIR, name))
+        except OSError:
+            print("hittade inte %s i Send/" % name, file=sys.stderr)
+            continue
+        print("Removed from send queue: %s" % name)
+        count += 1
+    return 0 if count else 1
+
+
+def cmd_clear():
+    """Tömmer hela Send/-kön (länkarna, inte originalen)."""
+    count = 0
+    for item in os.listdir(SEND_DIR):
+        try:
+            os.remove(os.path.join(SEND_DIR, item))
+            count += 1
+        except OSError:
+            pass
+    print("Cleared %d file(s) from send queue." % count)
+    return 0
 
 
 def cmd_send_pick():
@@ -1013,6 +1072,50 @@ def cmd_selftest():
         check("status-url bär token", token in st["url"], st["url"])
         check("QR-koden skapas (qrencode via stdin)", st["qr_ok"] is True)
         check("status har active-nyckeln (None när inget pågår)", st.get("active") is None, str(st.get("active")))
+
+        # Send-kön: dubblettskydd, borttagning, tömning. CLI:t i den här processen
+        # pekar på riktiga ~/Downloads/Sling, så SEND_DIR riktas om under provet.
+        saved_send_dir = SEND_DIR
+        globals()["SEND_DIR"] = test_send = os.path.join(tmp, "Send")
+        try:
+            doc1 = os.path.join(tmp, "fil1.txt")
+            with open(doc1, "w") as fh:
+                fh.write("sling test data 1")
+            cmd_send([doc1])
+            check("send köar filen", os.path.exists(os.path.join(test_send, "fil1.txt")))
+
+            cmd_send([doc1])
+            check("samma fil igen ger ingen _1-kopia", not os.path.exists(os.path.join(test_send, "fil1_1.txt")))
+
+            other = os.path.join(tmp, "annanstans")
+            os.makedirs(other, exist_ok=True)
+            doc2 = os.path.join(other, "fil1.txt")
+            with open(doc2, "w") as fh:
+                fh.write("annat innehåll")
+            cmd_send([doc2])
+            check("annan fil med samma namn får _1", os.path.exists(os.path.join(test_send, "fil1_1.txt")))
+
+            doc3 = os.path.join(tmp, "dod.txt")
+            with open(doc3, "w") as fh:
+                fh.write("x")
+            cmd_send([doc3])
+            os.remove(doc3)
+            doc3b = os.path.join(other, "dod.txt")
+            with open(doc3b, "w") as fh:
+                fh.write("y")
+            cmd_send([doc3b])
+            check("död länk ger plats åt namnet igen",
+                  os.path.realpath(os.path.join(test_send, "dod.txt")) == os.path.realpath(doc3b))
+
+            cmd_remove(["fil1.txt"])
+            check("remove tar bort ur kön", not os.path.exists(os.path.join(test_send, "fil1.txt")))
+            check("... men rör inte källfilen", os.path.exists(doc1))
+
+            cmd_clear()
+            check("clear tömmer kön", os.listdir(test_send) == [])
+            check("... utan att röra originalen", os.path.exists(doc1) and os.path.exists(doc2))
+        finally:
+            globals()["SEND_DIR"] = saved_send_dir
 
         # Token får aldrig hamna i en process kommandorad (argv) — en annan lokal
         # användare kan läsa den ur processlistan. Provet fångar arg-versionen av
@@ -1166,9 +1269,13 @@ def main():
     elif action == "status":
         sys.exit(cmd_status())
     elif action == "open":
-        sys.exit(cmd_open())
+        sys.exit(cmd_open(sys.argv[2] if len(sys.argv) > 2 else None))
     elif action == "send":
         sys.exit(cmd_send(sys.argv[2:]))
+    elif action == "remove":
+        sys.exit(cmd_remove(sys.argv[2:]))
+    elif action == "clear":
+        sys.exit(cmd_clear())
     elif action == "copy":
         sys.exit(cmd_copy(sys.argv[2] if len(sys.argv) > 2 else None))
     elif action == "send-pick":
@@ -1176,7 +1283,8 @@ def main():
     elif action == "selftest":
         sys.exit(cmd_selftest())
     else:
-        print("Usage: omarchy-sling [server | start | stop | status | open | send <fil...> | send-pick | copy [mdns] | selftest]")
+        print("Usage: omarchy-sling [server | start | stop | status | open [send] | send <fil...> | "
+              "remove <fil...> | clear | send-pick | copy [mdns] | selftest]")
         sys.exit(2)
 
 

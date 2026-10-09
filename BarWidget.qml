@@ -40,6 +40,11 @@ BarWidget {
       subtitle: "Scan with your regular phone camera",
       copied: "Link copied to clipboard!",
       recent_title: "📥 Recently received files:",
+      send_title: "📤 Files waiting to be sent",
+      remove: "Remove",
+      clear_all: "Clear all",
+      btn_open_send: "Open Send folder",
+      more: "more",
       btn_open: "📁 Open folder",
       btn_stop: "🛑 Stop",
       btn_start: "▶ Start",
@@ -55,6 +60,11 @@ BarWidget {
       subtitle: "Scanna med mobilens vanliga kamera",
       copied: "Länk kopierad till urklipp!",
       recent_title: "📥 Senast mottagna filer:",
+      send_title: "📤 Filer som väntar att skickas",
+      remove: "Ta bort",
+      clear_all: "Rensa alla",
+      btn_open_send: "Öppna skickamappen",
+      more: "fler",
       btn_open: "📁 Öppna mapp",
       btn_stop: "🛑 Stäng av",
       btn_start: "▶ Starta",
@@ -70,6 +80,11 @@ BarWidget {
       subtitle: "Scan met de camera van je telefoon",
       copied: "Link gekopieerd naar klembord!",
       recent_title: "📥 Recent ontvangen bestanden:",
+      send_title: "📤 Te verzenden bestanden",
+      remove: "Verwijderen",
+      clear_all: "Alles wissen",
+      btn_open_send: "Map Verzenden openen",
+      more: "meer",
       btn_open: "📁 Map openen",
       btn_stop: "🛑 Stoppen",
       btn_start: "▶ Starten",
@@ -85,6 +100,11 @@ BarWidget {
       subtitle: "スマホの標準カメラでスキャン",
       copied: "リンクをクリップボードにコピーしました！",
       recent_title: "📥 最近受信したファイル:",
+      send_title: "📤 送信待ちのファイル",
+      remove: "削除",
+      clear_all: "すべてクリア",
+      btn_open_send: "送信フォルダを開く",
+      more: "件以上",
       btn_open: "📁 フォルダを開く",
       btn_stop: "🛑 停止",
       btn_start: "▶ 開始",
@@ -100,6 +120,11 @@ BarWidget {
       subtitle: "Mit der Handykamera scannen",
       copied: "Link in Zwischenablage kopiert!",
       recent_title: "📥 Zuletzt empfangene Dateien:",
+      send_title: "📤 Zu sendende Dateien",
+      remove: "Entfernen",
+      clear_all: "Alle löschen",
+      btn_open_send: "Sendeordner öffnen",
+      more: "weitere",
       btn_open: "📁 Ordner öffnen",
       btn_stop: "🛑 Beenden",
       btn_start: "▶ Starten",
@@ -115,6 +140,11 @@ BarWidget {
       subtitle: "Scannez avec l'appareil photo du téléphone",
       copied: "Lien copié dans le presse-papiers !",
       recent_title: "📥 Fichiers récemment reçus :",
+      send_title: "📤 Fichiers en attente d'envoi",
+      remove: "Supprimer",
+      clear_all: "Tout effacer",
+      btn_open_send: "Ouvrir le dossier d'envoi",
+      more: "de plus",
       btn_open: "📁 Ouvrir le dossier",
       btn_stop: "🛑 Arrêter",
       btn_start: "▶ Démarrer",
@@ -130,6 +160,11 @@ BarWidget {
       subtitle: "Escanea con la cámara de tu móvil",
       copied: "¡Enlace copiado al portapapeles!",
       recent_title: "📥 Archivos recibidos recientemente:",
+      send_title: "📤 Archivos en espera de envío",
+      remove: "Eliminar",
+      clear_all: "Borrar todo",
+      btn_open_send: "Abrir carpeta de envío",
+      more: "más",
       btn_open: "📁 Abrir carpeta",
       btn_stop: "🛑 Detener",
       btn_start: "▶ Iniciar",
@@ -145,6 +180,11 @@ BarWidget {
       subtitle: "使用手机相机扫码",
       copied: "链接已复制到剪贴板！",
       recent_title: "📥 最近接收的文件:",
+      send_title: "📤 等待发送的文件",
+      remove: "移除",
+      clear_all: "清空全部",
+      btn_open_send: "打开发送文件夹",
+      more: "件",
       btn_open: "📁 打开文件夹",
       btn_stop: "🛑 停止",
       btn_start: "▶ 启动",
@@ -221,6 +261,18 @@ BarWidget {
   function copyUrl(which) {
     root.runSling("copy", which)
     if (root.bar) root.bar.showTooltip(root, root.str.copied)
+  }
+
+  // Kön hanteras av CLI:t (länken tas bort, aldrig originalfilen). Listan ritas om
+  // direkt så panelen inte står kvar med en rad som redan är borta.
+  function removeSendFile(name) {
+    root.sendFiles = root.sendFiles.filter(function(item) { return item.name !== name })
+    root.runSling("remove", name)
+  }
+
+  function clearSendFiles() {
+    root.sendFiles = []
+    root.runSling("clear")
   }
 
   // ---------------------------------------------------------------------------
@@ -556,14 +608,130 @@ BarWidget {
         }
       }
 
-      // Skicka-kön: filer i Send/ som väntar på telefonen
-      Text {
+      // Skicka-kön: filer i Send/ som väntar på telefonen. De fem senaste ritas,
+      // + N fler öppnar mappen. ✕/🗑 tar bort länken — originalet rörs aldrig.
+      Column {
         width: parent.width
+        spacing: Style.space(6)
         visible: root.sendFiles.length > 0
-        text: "📤 " + root.sendFiles.length + " " + root.str.waiting
-        color: Qt.darker(root.bar.foreground, 1.2)
-        font.family: root.bar.fontFamily
-        font.pixelSize: Style.font.caption
+
+        Item {
+          width: parent.width
+          height: Math.max(sendTitleText.implicitHeight, Style.space(22))
+
+          Text {
+            id: sendTitleText
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.str.send_title + " (" + root.sendFiles.length + "):"
+            color: Qt.darker(root.bar.foreground, 1.3)
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+          }
+
+          Row {
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(4)
+
+            PanelActionButton {
+              iconText: "📁"
+              tooltipText: root.str.btn_open_send
+              foreground: Qt.darker(root.bar.foreground, 1.3)
+              hoverColor: root.neonCyan
+              size: Style.space(20)
+              fontSize: Style.font.caption
+              onClicked: root.runSling("open", "send")
+            }
+
+            PanelActionButton {
+              iconText: "🗑"
+              tooltipText: root.str.clear_all
+              foreground: Qt.darker(root.bar.foreground, 1.3)
+              hoverColor: "#f7768e"
+              size: Style.space(20)
+              fontSize: Style.font.caption
+              onClicked: root.clearSendFiles()
+            }
+          }
+        }
+
+        Repeater {
+          model: root.sendFiles.slice(0, 5)
+
+          BorderSurface {
+            width: parent.width
+            height: Style.space(34)
+            radius: Style.space(6)
+            color: Qt.rgba(1, 1, 1, 0.04)
+            borderSpec: Border.controlSpec("normal", root.bar.foreground, Color.accent)
+
+            Row {
+              anchors.fill: parent
+              anchors.leftMargin: Style.space(10)
+              anchors.rightMargin: Style.space(6)
+              spacing: Style.space(6)
+
+              Text {
+                text: "📤"
+                anchors.verticalCenter: parent.verticalCenter
+                font.pixelSize: Style.font.bodySmall
+              }
+
+              Text {
+                text: modelData.name
+                color: root.bar.foreground
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
+                elide: Text.ElideMiddle
+                width: parent.width - Style.space(120)
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              Text {
+                text: modelData.size
+                color: Qt.darker(root.bar.foreground, 1.4)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              PanelActionButton {
+                iconText: "✕"
+                tooltipText: root.str.remove
+                foreground: Qt.darker(root.bar.foreground, 1.4)
+                hoverColor: "#f7768e"
+                size: Style.space(20)
+                fontSize: Style.font.caption
+                anchors.verticalCenter: parent.verticalCenter
+                onClicked: root.removeSendFile(modelData.name)
+              }
+            }
+          }
+        }
+
+        Item {
+          width: parent.width
+          height: Style.space(20)
+          visible: root.sendFiles.length > 5
+
+          Text {
+            anchors.centerIn: parent
+            text: "+ " + (root.sendFiles.length - 5) + " " + root.str.more + "…"
+            color: root.neonCyan
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          MouseArea {
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.runSling("open", "send")
+          }
+        }
       }
 
       // Recent Files Section
