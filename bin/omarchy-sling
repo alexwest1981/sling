@@ -2424,7 +2424,10 @@ def cmd_selftest():
         # nämnde "omarchy-sling server" (mätt: ett skal med texten i en kommentar).
         # Provet prövar urvalet, inte signalen, så inget annat än selftestens egen
         # sub-server kan komma i fråga.
-        oskyldig = subprocess.Popen(["bash", "-c", "while :; do sleep 1; done  # omarchy-sling server"])
+        # Skenet får ett eget tak (timeout 60): en krasch i ett prov lämnade en sådan
+        # process kvar på maskinen (mätt), och ett prov får inte lämna spår.
+        oskyldig = subprocess.Popen(["timeout", "60", "bash", "-c",
+                                     "while :; do sleep 1; done  # omarchy-sling server"])
         time.sleep(0.4)
         try:
             with open(os.path.join(sub_state, "pid")) as fh:
