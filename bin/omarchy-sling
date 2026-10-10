@@ -9,6 +9,7 @@
 # sekunder utan trafik.
 # ==============================================================================
 
+import ast
 import html
 import json
 import os
@@ -40,6 +41,12 @@ CLIP_MAX = int(os.environ.get("SLING_CLIP_MAX", 64 * 1024))
 # stänga får inte hänga "Send clipboard to phone".
 CLIP_TIMEOUT = float(os.environ.get("SLING_CLIP_TIMEOUT", "5"))
 SOCKET_TIMEOUT = int(os.environ.get("SLING_SOCKET_TIMEOUT", 30))
+# Tak för CLI:ts läsning av serverns eget /status. Panelen pollar den vägen, och en
+# granne på samma konto kan binda porten före oss och svara själv: utan tak buffras
+# ett ändlöst svar tills minnet tar slut, och urllibs timeout (per läsning) gör ingen
+# nytta mot en som droppar en byte då och då.
+STATUS_MAX = int(os.environ.get("SLING_STATUS_MAX", 1024 * 1024))
+STATUS_DEADLINE = float(os.environ.get("SLING_STATUS_DEADLINE", "4"))
 MDNS_NAME = os.environ.get("SLING_MDNS_NAME", "sling")
 # Sätts av cmd_server när avahi-publish-service faktiskt kör. Panelen visar
 # mDNS-adressen som "adressen att minnas", så den får bara visas när något
@@ -1232,11 +1239,44 @@ def status_dict(running=None):
     return data
 
 
+def läs_takad(r, tak=STATUS_MAX, deadline=STATUS_DEADLINE):
+    """Läser ett HTTP-svar med tak i både storlek och TID, eller None.
+
+    `read1`, inte `read`: `read(65536)` väntar tills bufferten är full, så en
+    motpart som droppar en byte då och då håller kvar en enskild läsning hur länge
+    som helst (mätt: ingen återkomst inom 20 s) medan `read1` ger tillbaka till
+    deadline-kontrollen varje gång. Både storleken och tiden måste ha ett tak:
+    urllibs `timeout` gäller per läsning, inte för hela svaret.
+    """
+    slut = time.monotonic() + deadline
+    bitar, med = [], 0
+    while True:
+        if time.monotonic() > slut:
+            return None
+        bit = r.read1(65536)
+        if not bit:
+            break
+        med += len(bit)
+        if med > tak:
+            return None
+        bitar.append(bit)
+    return b"".join(bitar)
+
+
 def server_status(token):
-    """Serverns egen /status, eller None om den inte svarar."""
+    """Serverns egen /status, eller None om den inte svarar.
+
+    En granne på samma konto kan binda porten före oss och svara själv, och panelen
+    pollar den här vägen var 1,5 s. Mätt mot en främmande lyssnare: ett svar utan
+    slut buffrades till 277 MB innan minnestaket slog till, och ett svar som droppade
+    en byte då och då höll kommandot kvar utan återkomst i 25 s (HANCORE, ärende 10821).
+    Taket i storlek är 1 MB: det rymmer tusentals köade filer i svaret, men inte ett
+    svar som aldrig tar slut.
+    """
     try:
         with urllib.request.urlopen("http://127.0.0.1:%d/t/%s/status" % (PORT, token), timeout=2) as r:
-            return json.loads(r.read())
+            kropp = läs_takad(r)
+        return json.loads(kropp) if kropp is not None else None
     except Exception:
         return None
 
@@ -1426,7 +1466,9 @@ def cmd_status():
 
 
 def cmd_open(which=None):
-    subprocess.run(["xdg-open", SEND_DIR if which == "send" else RECEIVED_DIR], check=False)
+    # Tak även här: en xdg-open mot en trasig portal kan stå kvar, och panelens
+    # knapp ska inte hänga på den. (Inventeringen i granska_sankor kräver ett tak.)
+    bounded_run(["xdg-open", SEND_DIR if which == "send" else RECEIVED_DIR], limit=4096, timeout=10)
     return 0
 
 
@@ -1551,13 +1593,154 @@ def cmd_clip():
 def cmd_send_pick():
     if not shutil.which("zenity"):
         print("zenity saknas — öppnar Send-mappen i stället", file=sys.stderr)
-        subprocess.run(["xdg-open", SEND_DIR], check=False)
+        bounded_run(["xdg-open", SEND_DIR], limit=4096, timeout=10)
         return 1
     r = subprocess.run(["zenity", "--file-selection", "--multiple", "--separator=\n",
                         "--title=Sling: skicka till telefonen"],
                        capture_output=True, text=True)
     paths = [line for line in r.stdout.splitlines() if line.strip()]
     return cmd_send(paths) if paths else 1
+
+
+# ------------------------------------------------------------------------------
+# Inventeringen: klassen av fynd, inte fyndet
+# ------------------------------------------------------------------------------
+# Varje runda i HANCORE:s granskning (ärende 10821) har varit samma klass: något
+# läser, väntar eller buffrar utan tak. Provet jag la till efter varje fynd fångade
+# fyndet — nästa kommentar namngav grannen till det (senast: `server_status` var
+# takad, men samma mönster satt kvar i grannfunktionen och i två xdg-open-anrop).
+# Den här inventeringen vänder på det: den läser den här filen med ast och kräver
+# att VARJE anrop till en känd strypkoppling är takad. Ett nytt otakat anrop
+# någonstans i filen gör sviten röd, oavsett var det står — och undantagslistan går
+# att granska i sig, eftersom varje post måste ha ett skäl och en funktion som
+# faktiskt finns kvar.
+STRYP_UNDANTAG = (
+    # Processer som med flit lever längre än anropet, eller är platsen som sätter taket
+    ("bounded_run", "platsen som sätter taket: Popen + wait(timeout) + gruppkill"),
+    ("cmd_start", "serverns egen demon — ska leva längre än anropet"),
+    ("start_mdns", "avahi-publish-service — publicerar tills servern stängs"),
+    ("cmd_send_pick", "zenity blockerar med flit tills användaren valt en fil"),
+    # Läsningar av våra egna filer: 0700-katalogen, skrivna av oss, eller en
+    # process egen kommandorad (kärnan takar argv)
+    ("read_token", "vår egen nyckelfil i en 0700-katalog"),
+    ("filmnehall", "vår egen nyckelfil i en 0700-katalog"),
+    ("generate_qr", "vår egen nyckelfil (URL:en) i en 0700-katalog"),
+    ("cmd_stop", "vår egen pidfil i en 0700-katalog"),
+    ("read_clip", "vårt eget urklippsslot, skrivet av oss med tak (CLIP_MAX)"),
+    ("pid_is_our_server", "en process egen kommandorad ur /proc"),
+    ("stale_publishers", "en process egen kommandorad ur /proc"),
+    ("granska_sankor", "läser sin egen källfil — den är vår, och den här raden är hela poängen"),
+    # Provhalvan läser sin egen scratch och svitens egen server
+    ("cmd_selftest", "prov som läser sin egen scratch och svitens egen server"),
+    ("cmd_abuse", "samma som cmd_selftest, för den otillförlitliga ytan"),
+)
+# Nätläsningarna har sin egen tabell: ett undantag där får INTE samtidigt ursäkta en
+# otakad filläsning i samma funktion. (Mätt på en röd kopia: med ett gemensamt
+# undantag gick `r.read()` i server_status fri, eftersom funktionen redan stod i
+# tabellen för sin urlopen — precis den klass inventeringen finns för att fånga.)
+STRYP_NÄT_UNDANTAG = (
+    ("server_status", "läser_takad(): STATUS_MAX byte OCH STATUS_DEADLINE sekunder"),
+    ("cmd_selftest", "prov mot svitens egen server i scratch"),
+    ("cmd_abuse", "samma som cmd_selftest, för den otillförlitliga ytan"),
+)
+
+
+def _undantagen(namn, tabell=None):
+    """Skälet för ett namngivet undantag, eller '' om funktionen inte står där."""
+    for n, skal in (STRYP_UNDANTAG if tabell is None else tabell):
+        if n == namn:
+            return skal
+    return ""
+
+
+def granska_sankor(källa=None, rapportera=False):
+    """Inventerar varje strypkoppling i den här filen (se kommentaren ovan).
+
+    Ger (namn, ok, detalj) per familj till sviten — eller hela listan som text, för
+    att kunna lägga till ett undantag med skäl i stället för att gissa.
+    """
+    with open(källa or os.path.abspath(__file__), encoding="utf-8") as fh:
+        träd = ast.parse(fh.read())
+    förälder = {}
+    for nod in ast.walk(träd):
+        for barn in ast.iter_child_nodes(nod):
+            förälder[barn] = nod
+
+    def omsluter(nod):
+        """Yttersta funktionsnamnet runt noden."""
+        namn, medan = "", nod
+        while medan in förälder:
+            medan = förälder[medan]
+            if isinstance(medan, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                namn = medan.name
+        return namn
+
+    def kort(nod, n=52):
+        try:
+            return " ".join(ast.unparse(nod).split())[:n]
+        except Exception:                   # noqa: BLE001 — en nod vi inte kan skriva ut
+            return "?"
+
+    def familj(namn):
+        sista = namn.split(".")[-1]
+        if namn.startswith("subprocess.") and namn.split(".")[1] in (
+                "run", "Popen", "call", "check_output", "check_call"):
+            return "processer"
+        if sista in ("read", "read1", "readline", "readlines", "recv", "recvfrom", "load", "loads"):
+            return "läsningar"
+        if sista in ("wait", "communicate"):
+            return "väntningar"
+        if namn.endswith("urlopen"):
+            return "nät"
+        return ""
+
+    funktioner = {n.name for n in ast.walk(träd)
+                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    funna = {f: [] for f in ("processer", "läsningar", "väntningar", "nät")}
+    antal = dict.fromkeys(funna, 0)
+    begagnade = set()
+    for nod in ast.walk(träd):
+        if not isinstance(nod, ast.Call):
+            continue
+        namn = kort(nod.func, 40)
+        f = familj(namn)
+        if not f:
+            continue
+        antal[f] += 1
+        fn = omsluter(nod)
+        if f == "nät":
+            takad = bool(_undantagen(fn, STRYP_NÄT_UNDANTAG))
+        elif f == "processer":
+            takad = any(k.arg == "timeout" for k in nod.keywords)
+        elif f == "läsningar":
+            takad = bool(nod.args)       # read(65536), inte read()
+        else:
+            takad = bool(nod.args) or any(k.arg == "timeout" for k in nod.keywords)
+        if takad:
+            begagnade.add(fn)
+        elif _undantagen(fn):
+            begagnade.add(fn)            # taket är namngivet: skälet står i tabellen
+        else:
+            funna[f].append("rad %d i %s: %s" % (nod.lineno, fn or "<modul>", kort(nod)))
+    if rapportera:
+        rader = []
+        for f in ("processer", "läsningar", "väntningar", "nät"):
+            rader.append("%-11s %d anrop" % (f, antal[f]))
+            rader += ["    otakad: " + x for x in funna[f]]
+        rader.append("undantag som inte längre begagnas: %s"
+                     % (sorted({n for n, _ in STRYP_UNDANTAG + STRYP_NÄT_UNDANTAG} - begagnade) or "inga"))
+        return "\n".join(rader)
+    ut = []
+    for f in ("processer", "läsningar", "väntningar", "nät"):
+        ut.append(("inventeringen: %s takade" % f, not funna[f],
+                   "%d anrop, %d otakade%s" % (antal[f], len(funna[f]),
+                                               ": " + "; ".join(funna[f][:3]) if funna[f] else "")))
+    kvar = sorted(n for n, _ in STRYP_UNDANTAG + STRYP_NÄT_UNDANTAG
+                  if n not in funktioner or n not in begagnade)
+    ut.append(("inventeringen: varje namngivet undantag begagnas", not kvar,
+               ", ".join(kvar) if kvar
+               else "%d undantag, alla med skäl" % (len(STRYP_UNDANTAG) + len(STRYP_NÄT_UNDANTAG))))
+    return ut
 
 
 # ------------------------------------------------------------------------------
@@ -1688,6 +1871,13 @@ def cmd_selftest(abuse=False):
                    '    fd = os.open(path, os.O_WRONLY | os.O_CREAT)\n')
         check("grindarna biter på de gamla formerna", len(source_shape_hits(_gammal)) == 2,
               str(source_shape_hits(_gammal)))
+
+        # Inventeringen: klassen, inte fyndet. Varje strypkoppling i filen — varje
+        # processanrop, läsning, väntan och nätläsning — måste vara takad eller stå
+        # med skäl i STRYP_UNDANTAG. Den som lägger till ett otakat anrop får sviten
+        # röd, var i filen det än står. (Körs även ensam: `omarchy-sling audit`.)
+        for _namn, _ok, _detalj in granska_sankor():
+            check(_namn, _ok, _detalj)
 
         _logg = os.path.join(_ddir, "server.log")
         _mode = stat.S_IMODE(os.stat(_logg).st_mode)
@@ -2733,7 +2923,136 @@ def cmd_selftest(abuse=False):
                 långsam_srv.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 långsam_srv.kill()
-        shutil.rmtree(tmp, ignore_errors=True)
+    # --- server_status mot en främmande lyssnare (HANCORE, ärende 10821) ---
+    # Panelen pollar serverns /status var 1,5 s, och en granne på samma konto kan
+    # binda porten före oss. Läsningen är takad i både storlek och tid. Provet kör
+    # läsaren i ett barn med 300 MB minnestak, så ett ändlöst svar syns som ett
+    # topp-minne långt över taket i stället för som svält på maskinen.
+    def starta_squatter(egen_port, beteende):
+        """En främmande lyssnare på porten: tiger, droppar en byte då och då, eller strömmar."""
+        sq = socket.socket()
+        sq.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sq.bind(("127.0.0.1", egen_port))
+        sq.listen(5)
+        sq_stopp = threading.Event()
+
+        def betjäna():
+            while not sq_stopp.is_set():
+                try:
+                    klient, _ = sq.accept()
+                except OSError:
+                    return
+                try:
+                    klient.recv(65536)
+                    if beteende == "tiger":
+                        continue                     # svarar aldrig
+                    klient.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n")
+                    if beteende == "droppar":
+                        klient.sendall(b'{"running": true')
+                        while not sq_stopp.is_set():
+                            time.sleep(0.2)
+                            klient.sendall(b"x")
+                    else:
+                        bit = b"x" * 262144
+                        while not sq_stopp.is_set():
+                            klient.sendall(bit)
+                except OSError:
+                    pass
+
+        threading.Thread(target=betjäna, daemon=True).start()
+        return sq, sq_stopp
+
+    for etikett, beteende, egen_port in (("ett ändlöst svar", "strömmar", port + 3),
+                                         ("ett droppande svar", "droppar", port + 4)):
+        sq, sq_stopp = starta_squatter(egen_port, beteende)
+        läskod = ("import importlib.machinery as m, importlib.util as u, resource, sys, os, time\n"
+                  "os.environ['XDG_RUNTIME_DIR'] = %r\n"
+                  "resource.setrlimit(resource.RLIMIT_AS, (300 * 1024 * 1024,) * 2)\n"
+                  "l = m.SourceFileLoader('sling', sys.argv[1])\n"
+                  "s = u.module_from_spec(u.spec_from_loader('sling', l))\n"
+                  "l.exec_module(s)\n"
+                  "s.PORT = int(sys.argv[2])\n"
+                  "t0 = time.monotonic()\n"
+                  "svar = s.server_status('prov')\n"
+                  "print('%%s|%%d|%%.1f' %% (svar, resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,"
+                  " time.monotonic() - t0))\n" % tmp)
+        rad = ""
+        try:
+            r = subprocess.run([sys.executable, "-c", läskod, os.path.abspath(__file__), str(egen_port)],
+                               capture_output=True, text=True, timeout=20)
+            rad = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()[-1] if (r.stdout or r.stderr) else ""
+        except subprocess.TimeoutExpired:
+            rad = "ingen återkomst inom 20 s"
+        finally:
+            sq_stopp.set()
+            sq.close()
+        delar = rad.split("|")
+        if len(delar) == 3:
+            svar, minne, tid = delar[0], int(delar[1]) / 1024.0, float(delar[2])
+            check("server_status mot %s stannar i taket" % etikett,
+                  svar == "None" and tid <= 10 and minne <= 120,
+                  "svar=%s, topp-minne=%.0f MB, %.1f s" % (svar, minne, tid))
+        else:
+            check("server_status mot %s stannar i taket" % etikett, False, rad[:90])
+
+    # Klassprovet: *varje* ingång en användare (eller panelen) kan trycka på, mot
+    # samma sorts motpart, i ett barn med minnestak och hård tidsgräns. Provet per
+    # fynd fångar fyndet — det här fångar klassen för hela ytan på en gång: ingen
+    # ingång får hänga eller växa för att någon annan håller porten. `open`, `copy`
+    # och `send-pick` körs inte här: de rör Alex skärm och urklipp, och deras
+    # läsningar granskas statiskt av inventeringen ovan i stället.
+    matris = os.path.join(tmp, "matris")
+    for mapp in ("Received", "Send", "run/sling"):
+        os.makedirs(os.path.join(matris, mapp), exist_ok=True)
+    with open(os.path.join(matris, "run", "sling", "token"), "w") as fh:
+        fh.write("matris-token")
+    matris_env = dict(env, SLING_BASE_DIR=matris, XDG_RUNTIME_DIR=os.path.join(matris, "run"),
+                      XDG_STATE_HOME=matris)
+    matriskod = (
+        "import importlib.machinery as m, importlib.util as u, resource, sys, time\n"
+        "resource.setrlimit(resource.RLIMIT_AS, (300 * 1024 * 1024,) * 2)\n"
+        "l = m.SourceFileLoader('sling', sys.argv[1])\n"
+        "s = u.module_from_spec(u.spec_from_loader('sling', l))\n"
+        "l.exec_module(s)\n"
+        "sys.argv = ['sling'] + sys.argv[2:]\n"
+        "t0 = time.monotonic()\n"
+        "try:\n"
+        "    rc = s.main()\n"
+        "except SystemExit as e:\n"
+        "    rc = e.code\n"
+        "except BaseException:\n"
+        "    rc = 'fel'\n"
+        "print('MATRIS|%s|%.1f|%d' % (rc, time.monotonic() - t0,"
+        " resource.getrusage(resource.RUSAGE_SELF).ru_maxrss))\n")
+    for etikett, beteende, egen_port in (("en som aldrig svarar", "tiger", port + 5),
+                                         ("en som droppar", "droppar", port + 6),
+                                         ("en som strömmar", "strömmar", port + 7)):
+        sq, sq_stopp = starta_squatter(egen_port, beteende)
+        matris_env["SLING_PORT"] = str(egen_port)      # motpartens port, inte svitens egen
+        rader, problem = [], []
+        for argv in (["status"], ["clip"], ["remove", "finns-inte"], ["clear"]):
+            rad = ""
+            try:
+                r = subprocess.run([sys.executable, "-c", matriskod, os.path.abspath(__file__)] + argv,
+                                   env=matris_env, capture_output=True, text=True, timeout=15)
+                rader_ut = ((r.stdout or "") + "\n" + (r.stderr or "")).splitlines()
+                rad = next((x for x in rader_ut if x.startswith("MATRIS|")), rad)
+            except subprocess.TimeoutExpired:
+                rad = "MATRIS|ingen återkomst|15.0|0"
+            delar = rad.split("|")
+            if len(delar) == 4:
+                rc, tid, minne = delar[1], float(delar[2]), int(delar[3]) / 1024.0
+                rader.append("%s: %s %.1f s %.0f MB" % (argv[0], rc, tid, minne))
+                if rc not in ("0", "1", "None", "2") or tid > 10 or minne > 120:
+                    problem.append("%s rc=%s %.1f s %.0f MB" % (argv[0], rc, tid, minne))
+            else:
+                rader.append("%s: %s" % (argv[0], rad[:40]))
+                problem.append("%s: %s" % (argv[0], rad[:40]))
+        sq_stopp.set()
+        sq.close()
+        check("varje ingång mot %s stannar i taket" % etikett, not problem, "; ".join(rader))
+
+    shutil.rmtree(tmp, ignore_errors=True)
 
     if abuse_rapport:
         print(abuse_rapport)
@@ -3162,6 +3481,10 @@ def main():
         sys.exit(cmd_clip())
     elif action == "send-pick":
         sys.exit(cmd_send_pick())
+    elif action == "audit":
+        # Inventeringen ensam: vilka strypkopplingar finns i filen, och vilka saknar tak.
+        print(granska_sankor(rapportera=True))
+        sys.exit(0)
     elif action in ("selftest", "abuse"):
         # abuse kör samma svit först och sedan den otillförlitliga ytan: en körning,
         # en dom — allt som går att pröva utan att röra användarens filer.
