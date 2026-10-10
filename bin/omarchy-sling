@@ -1398,7 +1398,10 @@ def cmd_copy(which=None):
     if not shutil.which("wl-copy"):
         print("wl-copy saknas", file=sys.stderr)
         return 1
-    subprocess.run(["wl-copy"], input=url.encode(), check=False)
+    # Takad körning, som allt annat som startar en process åt användaren: ett
+    # hängande wl-copy (urklippstjänst som inte svarar) lämnade förut kommandot utan
+    # återkomst och två processer kvar — mätt: ingen återkomst inom 15 s.
+    bounded_run(["wl-copy"], data=url.encode())
     print(url)
     return 0
 
@@ -2081,26 +2084,24 @@ def cmd_selftest():
               oct(stat.S_IMODE(os.stat(os.path.join(tmp, "qr-test.png")).st_mode))[-3:])
 
         # Samma skydd för kopieringen: wl-copy ska få URL:en på stdin, aldrig i argv.
+        # (Kopieringen går genom bounded_run, som QR-koden — därför spioneras den.)
         saved_token_file = globals()["TOKEN_FILE"]
         globals()["TOKEN_FILE"] = os.path.join(tmp, "sling", "token")
         globals()["_TOKEN"] = ""
-        seen_copy = {"cmd": [], "input": None}
-        real_copy_run = subprocess.run
+        seen_copy = {"cmd": [], "data": None}
+        real_bounded_copy = globals()["bounded_run"]
 
-        class FakeDone:
-            returncode = 0
-
-        def spy_copy(cmd, **kw):
+        def spy_copy(cmd, data=None, limit=None, timeout=None):
             seen_copy["cmd"] = list(cmd)
-            seen_copy["input"] = kw.get("input")
-            return FakeDone()
+            seen_copy["data"] = data
+            return 0, b""
 
         try:
-            subprocess.run = spy_copy
+            globals()["bounded_run"] = spy_copy
             try:
                 rc = cmd_copy()
             finally:
-                subprocess.run = real_copy_run
+                globals()["bounded_run"] = real_bounded_copy
         finally:
             globals()["TOKEN_FILE"] = saved_token_file
             globals()["_TOKEN"] = ""
@@ -2108,8 +2109,8 @@ def cmd_selftest():
         check("kopieringen går via stdin, inte argv",
               rc == 0 and joined_copy == "wl-copy" and token not in joined_copy, "argv: " + joined_copy)
         check("  ... och bär hela token-URL:en",
-              (seen_copy["input"] or b"").decode().endswith("/t/%s/" % token),
-              "%d byte på stdin" % len(seen_copy["input"] or b""))
+              (seen_copy["data"] or b"").decode().endswith("/t/%s/" % token),
+              "%d byte på stdin" % len(seen_copy["data"] or b""))
 
         # Förloppsindikatorn mäts mitt i en överföring. Kroppen skickas i bitar med
         # paus, så servern står kvar i läsningen och 'active' går att se — till
@@ -2362,6 +2363,62 @@ def cmd_selftest():
         check("  ... och lämnar ingen process kvar", len(notis_pidar) == 2 and not kvar_notis,
               "%d pidar, kvar: %s" % (len(notis_pidar), kvar_notis))
         for p in kvar_notis:
+            try:
+                os.kill(p, signal.SIGKILL)
+            except OSError:
+                pass
+
+        # `copy` (URL:en till urklippet) var det sista subprocess-anropet utan tak
+        # kvar i filen: ett hängande wl-copy lämnade kommandot utan återkomst och två
+        # processer kvar — samma klass som /clip och notisen, ett kommando längre bort.
+        # PATH riktas om till skalet under anropet (först i PATH, resten kvar så att
+        # `sleep` inne i skalet finns), så provet varken rör Alex urklipp eller nätet,
+        # och anropet körs i en tråd: en kvarhängande körning ska synas som ett
+        # underkänt prov, inte hänga hela selftesten.
+        copy_pidfil = os.path.join(tmp, "copy-hang.pid")
+        with open(os.path.join(shim, "wl-copy"), "w") as fh:
+            fh.write("#!/bin/sh\nsleep 4323 &\necho \"$$ $!\" > '%s'\nexec sleep 4323\n" % copy_pidfil)
+        os.chmod(os.path.join(shim, "wl-copy"), 0o755)
+        sparat_token = globals()["_TOKEN"]
+        sparat_path = os.environ.get("PATH", "")
+        globals()["_TOKEN"] = "provtoken"
+        os.environ["PATH"] = shim + (":" + sparat_path if sparat_path else "")
+        kort = {}
+
+        def kor_copy():
+            try:
+                kort["kod"] = cmd_copy()
+            except Exception as exc:                   # noqa: BLE001 — provet rapporterar själv
+                kort["kod"] = repr(exc)
+
+        t0 = time.monotonic()
+        ctråd = threading.Thread(target=kor_copy, daemon=True)
+        ctråd.start()
+        ctråd.join(15)
+        copy_tid = time.monotonic() - t0
+        hängde_kvar = ctråd.is_alive()
+        os.environ["PATH"] = sparat_path
+        globals()["_TOKEN"] = sparat_token
+        with open(os.path.join(shim, "wl-copy"), "w") as fh:
+            fh.write('printf "%%s\\n" "$*" >> "%s"\ncat > "%s"\n' % (clip_argv, clip_out))
+        os.chmod(os.path.join(shim, "wl-copy"), 0o755)
+        try:
+            with open(copy_pidfil) as fh:
+                copy_pidar = [int(p) for p in fh.read().split()]
+        except (OSError, ValueError):
+            copy_pidar = []
+        kvar_copy = []
+        for _ in range(20):
+            kvar_copy = [p for p in copy_pidar if lever(p)]
+            if not kvar_copy:
+                break
+            time.sleep(0.1)
+        check("hängande wl-copy i `copy` ger återkomst inom taket",
+              not hängde_kvar and kort.get("kod") == 0 and copy_tid < 10,
+              "%s efter %.1f s%s" % (kort.get("kod"), copy_tid, " (hängde kvar)" if hängde_kvar else ""))
+        check("  ... och lämnar ingen process kvar", len(copy_pidar) == 2 and not kvar_copy,
+              "%d pidar, kvar: %s" % (len(copy_pidar), kvar_copy))
+        for p in kvar_copy:
             try:
                 os.kill(p, signal.SIGKILL)
             except OSError:
