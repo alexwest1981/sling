@@ -984,7 +984,13 @@ class SlingHandler(BaseHTTPRequestHandler):
             self._send(200, page, "text/html; charset=utf-8", {"Cache-Control": "no-store"})
 
         elif rest == "/status":
-            self._send(200, json.dumps(status_dict(True)).encode(), "application/json")
+            # Telefonen får namn, storlekar och adressen — inte var filerna ligger.
+            # CLI:ts `status` visar allt; över nätet stryks de lokala sökvägarna, för
+            # de säger bara var hemkatalogen och användarnamnet är (abuse-sviten).
+            svar = status_dict(True)
+            for nyckel in ("qr_path", "received_dir", "send_dir"):
+                svar.pop(nyckel, None)
+            self._send(200, json.dumps(svar).encode(), "application/json")
 
         elif rest == "/clip":
             # Det PC-användaren delat. Skrivs bara av cmd_clip, aldrig av servern.
@@ -1001,6 +1007,11 @@ class SlingHandler(BaseHTTPRequestHandler):
                 try:
                     handtag = open(os.path.join(SEND_DIR, name), "rb")
                 except OSError:
+                    handtag = None
+                except ValueError:
+                    # Ett URL-kodat %00 blir ett NUL-tecken i namnet och open() kastar
+                    # ValueError — som inte är en OSError. Utan den här grenen dog
+                    # förfrågan utan svar (abuse-sviten: kod 0 i stället för 404).
                     handtag = None
             if handtag is None:
                 self._send(404)
@@ -1054,6 +1065,7 @@ class SlingHandler(BaseHTTPRequestHandler):
         # för evigt — 32 sådana tar hela anslutningstaket och servern nekar alla.
         rc, _ = bounded_run(["wl-copy"], data=text)
         if rc != 0:
+            log("urklipp från telefonen misslyckades: wl-copy gav rc=%d (%d byte)" % (rc, len(text)))
             self._send(500, json.dumps({"ok": False, "error": "wl-copy failed"}).encode(), "application/json")
             return
         # Notisen säger bara att något kommit — innehållet är privat metadata och
@@ -1551,7 +1563,7 @@ def cmd_send_pick():
 # ------------------------------------------------------------------------------
 # Egenkontroll: parsern, token-grinden, taket
 # ------------------------------------------------------------------------------
-def cmd_selftest():
+def cmd_selftest(abuse=False):
     """Kör en server på egen port i en städad miljö och verifierar att filer kommer
     fram byte-identiska, att saknad/fel token nekas och att storlekstaket håller."""
     import tempfile
@@ -1599,6 +1611,7 @@ def cmd_selftest():
                             env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     failures = []
     counted = {"n": 0}
+    abuse_rapport = ""
 
     def check(name, cond, detail=""):
         counted["n"] += 1
@@ -2319,7 +2332,8 @@ def cmd_selftest():
         # stat-anropet fick förut förfrågan att dö utan svar — mätt 3092 av 5634
         # /status-anrop. Ett 404 är ett svar; ett tyst avbrott är det inte.
         for i in range(20):
-            with open(os.path.join(mottaget, "churn%d.bin" % i), "wb") as fh:
+            with os.fdopen(os.open(os.path.join(mottaget, "churn%d.bin" % i),
+                                        os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as fh:
                 fh.write(b"x" * 4096)
         slut = threading.Event()
 
@@ -2328,7 +2342,8 @@ def cmd_selftest():
                 for i in range(20):
                     try:
                         os.remove(os.path.join(mottaget, "churn%d.bin" % i))
-                        with open(os.path.join(mottaget, "churn%d.bin" % i), "wb") as fh:
+                        with os.fdopen(os.open(os.path.join(mottaget, "churn%d.bin" % i),
+                                        os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as fh:
                             fh.write(b"x" * 4096)
                     except OSError:
                         pass
@@ -2499,6 +2514,11 @@ def cmd_selftest():
                 os.kill(p, signal.SIGKILL)
             except OSError:
                 pass
+
+        if abuse:
+            abuse_rapport = cmd_abuse({"check": check, "post": post, "multipart": multipart,
+                                       "counted": counted, "shim": shim, "proc": proc},
+                                      port, token, tmp)
     finally:
         proc.terminate()
         try:
@@ -2715,12 +2735,407 @@ def cmd_selftest():
                 långsam_srv.kill()
         shutil.rmtree(tmp, ignore_errors=True)
 
+    if abuse_rapport:
+        print(abuse_rapport)
     print("\n%d kontroller, %d misslyckade" % (counted["n"], len(failures)))
     if failures:
         print("MISSLYCKADE: " + ", ".join(failures))
         return 1
     print("Sling selftest: OK")
     return 0
+
+
+# ------------------------------------------------------------------------------
+# Den otillförlitliga ytan: varje ingång matas med skräp, varje klass krävs
+# ------------------------------------------------------------------------------
+# Klasserna är de nio granskningarna har filat i (bounds, identitet, rättigheter,
+# race, markup, argv/stdin, sökväg, tyst fel, livscykel). Cellen "n/a" är ett
+# påstående som måste bäras av ett skäl — en tyst lucka är precis vad som gjorde att
+# varje runda hittade något nytt. "prov" prövas här, "snabb" är redan bevisad i den
+# vanliga sviten (som den här körningen alltid gör först).
+#
+# Allt körs mot svitens egen server i en scratch-katalog: inget rör användarens
+# urklipp, mottagna filer eller skärm.
+ABUSE_MATRIX = {
+    "token/HTTP": ("bounds, identitet, sökväg, tyst fel",
+                   "markup, argv, rättigheter, race, livscykel: ingen data ur en förfrågan når en fil, en process eller en yta"),
+    "/upload": ("bounds, sökväg, rättigheter, tyst fel",
+                "markup, argv, identitet, race, livscykel: kroppen blir filer i en privat katalog, aldrig uppmärkning eller ett argument"),
+    "filnamn": ("sökväg, markup, argv, rättigheter",
+                "bounds, identitet, race, livscykel: ett namn är data — det startar ingen process och äger inget"),
+    "/download": ("sökväg, tyst fel",
+                  "bounds (taket mäts i /upload), identitet, race (bevisad i den vanliga sviten), markup, argv, rättigheter, livscykel"),
+    "/clip": ("argv, tyst fel",
+              "markup, sökväg, identitet, rättigheter, race, livscykel; bounds bevisad i den vanliga sviten"),
+    "/status och sidan": ("markup, sökväg",
+                          "bounds, identitet, argv, rättigheter, race, livscykel: ytan visar namn och storlekar, inget som går vidare"),
+    "socketar": ("bounds, tyst fel, race",
+                 "markup, argv, sökväg, rättigheter, identitet, livscykel: en socket är en socket, inget mer"),
+    "tillståndsfiler": ("rättigheter",
+                        "bounds, markup, argv, sökväg, identitet, race (bevisad i den vanliga sviten), tyst fel, livscykel"),
+    "processer": ("argv, livscykel",
+                  "bounds, markup, sökväg, rättigheter, race; identitet bevisad i den vanliga sviten"),
+}
+
+
+def cmd_abuse(h, port, token, tmp):
+    """Matar den otillförlitliga ytan med skräp och kräver att invariants håller."""
+    starträknare = h["counted"]["n"]
+    check = h["check"]
+    post = h["post"]
+    multipart = h["multipart"]
+    received = os.path.join(tmp, "Received")
+    send_dir = os.path.join(tmp, "Send")
+    server_pid = h["proc"].pid
+    shim = h["shim"]
+    cap = int(os.environ.get("SLING_MAX_UPLOAD") or 2 * 1024 * 1024)
+
+    def raw(data, timeout=6, stop_after=65536, half_close=False):
+        """Rå byte på egen socket. Returnerar (svar, dog_av_tidsgräns)."""
+        s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        buf = b""
+        tidsut = False
+        try:
+            try:
+                s.sendall(data)
+            except OSError:
+                return buf, False
+            if half_close:
+                try:
+                    s.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+            s.settimeout(timeout)
+            while len(buf) < stop_after:
+                try:
+                    bit = s.recv(65536)
+                except (socket.timeout, TimeoutError):
+                    tidsut = True
+                    break
+                except OSError:
+                    break
+                if not bit:
+                    break
+                buf += bit
+        finally:
+            s.close()
+        return buf, tidsut
+
+    def kod(svar):
+        m = re.match(rb"HTTP/1\.[01] (\d{3})", svar or b"")
+        return int(m.group(1)) if m else 0
+
+    def lever_efter():
+        try:
+            svar, _ = raw(b"GET /t/%s/status HTTP/1.0\r\n\r\n" % token.encode())
+            return kod(svar) == 200
+        except OSError:
+            return False
+
+    def katalog(directory):
+        try:
+            return sorted(os.listdir(directory))
+        except OSError:
+            return []
+
+    def fd_och_tradar():
+        try:
+            return len(os.listdir("/proc/%d/task" % server_pid)), len(os.listdir("/proc/%d/fd" % server_pid))
+        except OSError:
+            return -1, -1
+
+    def rss():
+        try:
+            for rad in open("/proc/%d/status" % server_pid, encoding="utf-8"):
+                if rad.startswith("VmRSS:"):
+                    return int(rad.split()[1])
+        except OSError:
+            pass
+        return -1
+
+    # Provkoden byter ut skenfilerna mot varianter som hänger sig (tak-proven), så den
+    # otillförlitliga ytan måste mötas av den vanliga skenfilen — annars mäter passet
+    # provets egen skenfil i stället för servern (mätt: en 500:a kom därifrån).
+    for sken, argv_fil, in_fil in (("wl-copy", os.path.join(tmp, "clip-argv.txt"),
+                                    os.path.join(tmp, "clip-stdin.txt")),
+                                   ("notify-send", os.path.join(tmp, "notify-argv.txt"), None)):
+        kropp = '#!/bin/sh\nprintf "%s\\n" "$*" >> "' + argv_fil + '"\n'
+        if in_fil:
+            kropp += 'cat > "' + in_fil + '"\n'
+        with open(os.path.join(shim, sken), "w") as fh:
+            fh.write(kropp)
+        os.chmod(os.path.join(shim, sken), 0o755)
+
+    före_tradar, före_fds = fd_och_tradar()
+    kanariefågel = os.path.join(tmp, "kanariefågel.txt")
+    with open(kanariefågel, "w", encoding="utf-8") as fh:
+        fh.write("orörd\n")
+    etc_före = os.stat("/etc/passwd").st_mtime_ns
+
+    # --- token/HTTP: grinden, sökvägen efter den, och att skräp får ett svar ---
+    svar, _ = raw(b"GET / HTTP/1.0\r\n\r\n")
+    check("abuse: utan token blir svaret 403, inte tystnad", kod(svar) == 403, "kod %d, %d byte" % (kod(svar), len(svar)))
+    svar, _ = raw(b"GET /t/zzzzzzzzzzz/ HTTP/1.0\r\n\r\n")
+    check("abuse: fel token blir 403", kod(svar) == 403, "kod %d" % kod(svar))
+    svar, _ = raw(b"GET /t/%s%%00/ HTTP/1.0\r\n\r\n" % token.encode())
+    check("abuse: token med %%00 släpps inte in", kod(svar) != 200, "kod %d" % kod(svar))
+    svar, _ = raw(b"GET /t/%s HTTP/1.0\r\n\r\n" % token.encode())
+    check("abuse: token utan snedstreck svarar sidan", kod(svar) == 200, "kod %d" % kod(svar))
+    svar, _ = raw(b"GET /t/%s/download/../../../../etc/passwd HTTP/1.0\r\n\r\n" % token.encode())
+    check("abuse: traversal efter token ger 404 och rör inget utanför",
+          kod(svar) == 404 and os.stat("/etc/passwd").st_mtime_ns == etc_före,
+          "kod %d" % kod(svar))
+    svar, _ = raw(b"GET /t/%s/download/%%2e%%2e%%2f%%2e%%2e%%2fetc%%2fpasswd HTTP/1.0\r\n\r\n" % token.encode())
+    check("abuse: kodad traversal ger 404", kod(svar) == 404, "kod %d" % kod(svar))
+    svar, _ = raw(b"PUT /t/%s/status HTTP/1.0\r\nContent-Length: 0\r\n\r\n" % token.encode())
+    check("abuse: fel metod får ett svar, inte tystnad", kod(svar) in (400, 404, 405, 501), "kod %d" % kod(svar))
+    svar, _ = raw(b"GET /" + b"a" * 16384 + b" HTTP/1.0\r\n\r\n")
+    check("abuse: 16 kB lång begäranderad får ett svar och servern lever",
+          kod(svar) != 0 and lever_efter(), "kod %d" % kod(svar))
+    svar, _ = raw(b"SKRAP SKRAP SKRAP\r\n\r\n")
+    check("abuse: ren dynga får ett svar eller stängs rent, och servern lever",
+          kod(svar) in (0, 400) and lever_efter(), "kod %d" % kod(svar))
+    svar, _ = raw(b"GET /t/%s/status HTTP/1.0\r\n" + b"X-Skrap: " + b"b" * 70000 + b"\r\n\r\n")
+    check("abuse: 70 kB rubrik svarar eller stängs rent", lever_efter(), "kod %d" % kod(svar))
+
+    # --- /upload: kroppen, taket och halva filer ---
+    svar, _ = raw(b"POST /t/%s/upload HTTP/1.0\r\nContent-Length: 10\r\n\r\n0123456789" % token.encode())
+    check("abuse: POST utan Content-Type får ett svar", kod(svar) in (400, 411, 415, 500) and lever_efter(), "kod %d" % kod(svar))
+    svar, _ = raw(b"POST /t/%s/upload HTTP/1.0\r\nContent-Type: multipart/form-data\r\nContent-Length: 10\r\n\r\n0123456789" % token.encode())
+    check("abuse: Content-Type utan boundary får ett svar", kod(svar) in (200, 400, 500) and lever_efter(), "kod %d" % kod(svar))
+    svar, _ = raw(b"POST /t/%s/upload HTTP/1.0\r\nContent-Type: multipart/form-data; boundary=b\r\nContent-Length: abc\r\n\r\n" % token.encode())
+    check("abuse: skräp som Content-Length får ett svar", kod(svar) in (200, 400, 411, 500) and lever_efter(), "kod %d" % kod(svar))
+    # Taket gäller hela kroppen, multipart-rubriker inräknade — mät på kroppen.
+    kropp, ctype = multipart([("tak-jamnt.bin", b"")])
+    fyll = cap - len(kropp)
+    kropp, ctype = multipart([("tak-jamnt.bin", b"n" * fyll)])
+    t0 = time.monotonic()
+    svar, _ = raw(("POST /t/%s/upload HTTP/1.0\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n"
+                   % (token, ctype, len(kropp))).encode() + kropp)
+    tid = time.monotonic() - t0
+    check("abuse: kroppen på exakt taket går igenom",
+          kod(svar) == 200 and tid < 10 and os.path.getsize(os.path.join(received, "tak-jamnt.bin")) == fyll,
+          "kod %d, %d byte, %.1f s" % (kod(svar), os.path.getsize(os.path.join(received, "tak-jamnt.bin")) if os.path.exists(os.path.join(received, "tak-jamnt.bin")) else -1, tid))
+    # Samma namn som i provet ovan: rubrikens längd räknas in i kroppen, så namnet får
+    # inte skilja sig (då blir "en byte över" i själva verket exakt taket).
+    kropp, ctype = multipart([("tak-over.bin", b"")])
+    fyll = cap + 1 - len(kropp)
+    kropp, ctype = multipart([("tak-over.bin", b"n" * fyll)])
+    svar, _ = raw(("POST /t/%s/upload HTTP/1.0\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n"
+                   % (token, ctype, len(kropp))).encode() + kropp, half_close=True)
+    check("abuse: en byte över taket avvisas (413)",
+          kod(svar) == 413 and len(kropp) == cap + 1 and "tak-over.bin" not in katalog(received),
+          "kod %d, kropp %d (tak %d)" % (kod(svar), len(kropp), cap))
+    t0 = time.monotonic()
+    svar, _ = raw(("POST /t/%s/upload HTTP/1.0\r\nContent-Type: multipart/form-data; boundary=b\r\n"
+                   "Content-Length: %d\r\n\r\n--b\r\n" % (token, cap * 20)).encode(), half_close=True)
+    tid = time.monotonic() - t0
+    check("abuse: en deklarerad längd långt över taket avvisas utan att vänta på kroppen",
+          kod(svar) == 413 and tid < 3, "kod %d efter %.1f s" % (kod(svar), tid))
+    kropp, ctype = multipart([("halv.bin", os.urandom(300000))])
+    halva = len(kropp) // 2
+    raw(("POST /t/%s/upload HTTP/1.0\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n"
+         % (token, ctype, len(kropp))).encode() + kropp[:halva], half_close=True)
+    time.sleep(0.5)
+    check("abuse: en kropp som kapas lämnar ingen halv fil",
+          "halv.bin" not in katalog(received) and lever_efter())
+    # Kroppen måste vara AVKLIPPT: skickade man hela (med slutgräns) är filen hel och
+    # rätt, och provet mäter ingenting.
+    kropp, ctype = multipart([("lögn.bin", os.urandom(200000))])
+    raw(("POST /t/%s/upload HTTP/1.0\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n"
+         % (token, ctype, len(kropp) * 4)).encode() + kropp[:len(kropp) // 2], half_close=True)
+    time.sleep(0.5)
+    check("abuse: en avklippt kropp med lögnaktig längd lämnar ingen halv fil",
+          "lögn.bin" not in katalog(received) and lever_efter(), str(katalog(received)[-3:]))
+    före_rss = rss()
+    kropp, ctype = multipart([("efter-skräp.bin", b"z" * 1000)])
+    raw(("POST /t/%s/upload HTTP/1.0\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n"
+         % (token, ctype, 5 * 1024 * 1024 + len(kropp))).encode() + b"9" * (5 * 1024 * 1024) + kropp, half_close=True)
+    time.sleep(0.5)
+    växt = rss() - före_rss
+    check("abuse: 5 MB skräp före första gränsen håller minnet bundet",
+          -1 < växt < 4096 and lever_efter(), "RSS %+d kB" % växt)
+    råa = b"POST /t/%s/upload HTTP/1.0\r\nContent-Type: multipart/form-data; boundary=b\r\nContent-Length: %d\r\n\r\n" % (token.encode(), 1024 * 1024)
+    raw(råa + b"--b\r\nContent-Disposition: form-data; name=\"files\"; filename=\"x.bin\"\r\n" + b"c" * (1024 * 1024), half_close=True)
+    time.sleep(0.5)
+    check("abuse: en del vars rubriker aldrig tar slut avbryts", "x.bin" not in katalog(received) and lever_efter())
+    kropp, ctype = multipart([("utan-namn-fält", b"inte en fil")])
+    st, svarj = post([], token)
+    check("abuse: en del utan filnamn blir ingen fil", st == 200 and svarj.get("saved") == [], "%s: %s" % (st, svarj.get("saved")))
+    kropp, ctype = multipart([("först-hel.bin", b"a" * 5000), ("sen-kapad.bin", os.urandom(200000))])
+    raw(("POST /t/%s/upload HTTP/1.0\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n"
+         % (token, ctype, len(kropp))).encode() + kropp[:len(kropp) - 150000], half_close=True)
+    time.sleep(0.5)
+    check("abuse: när en senare del kapas står den första kvar hel och den kapade blir ingen fil",
+          os.path.exists(os.path.join(received, "först-hel.bin"))
+          and os.path.getsize(os.path.join(received, "först-hel.bin")) == 5000
+          and "sen-kapad.bin" not in katalog(received))
+    st, svarj = post([("innehaall.bin", b"--" + b"b" + b"\r\nContent-Disposition: form-data; name=\"files\"; filename=\"inne.bin\"\r\n\r\nX")], token)
+    check("abuse: en gränssträng i innehållet får ett svar och kraschar inget", st in (200, 400, 500) and lever_efter(), "kod %s" % st)
+
+    # --- filnamn: sökväg, uppmärkning, vad som får bli en fil ---
+    st, svarj = post([("../../etc/passwd", b"kapat")], token)
+    check("abuse: ett namn med traversal blir en fil i Received, inget utanför",
+          st == 200 and svarj.get("saved") == ["passwd"] and os.stat("/etc/passwd").st_mtime_ns == etc_före,
+          "%s: %s" % (st, svarj.get("saved")))
+    st, svarj = post([("l" * 250 + ".bin", b"x")], token)
+    check("abuse: ett 250 byte långt namn hoppas över", st == 200 and svarj.get("saved") == [], "%s" % svarj.get("saved"))
+    st, svarj = post([("rad\nbrytning.bin", b"x")], token)
+    check("abuse: ett namn med radbrytning hoppas över", st == 200 and svarj.get("saved") == [], "%s" % svarj.get("saved"))
+    st, svarj = post([(".dold.bin", b"x"), ("-rf", b"x"), ("namn med mellanslag.bin", b"x")], token)
+    check("abuse: dolt namn, bindestreck och mellanslag blir filer", st == 200 and len(svarj.get("saved", [])) == 3,
+          "%s" % svarj.get("saved"))
+    ond = "<img src=x onerror=alert(1)>.txt"
+    st, _ = post([(ond, b"x")], token)
+    with open(os.path.join(send_dir, ond), "wb") as fh:      # kön listas på telefonsidan
+        fh.write(b"x")
+    svar, _ = raw(b"GET /t/%s/ HTTP/1.0\r\n\r\n" % token.encode(), stop_after=400000)
+    check("abuse: ett namn som ser ut som uppmärkning escapas på sidan",
+          st == 200 and b"<img src=x" not in svar and b"&lt;img" in svar,
+          "sparat %s, rå markup i svaret: %s, escapad: %s" % (st, b"<img src=x" in svar, b"&lt;img" in svar))
+    höger = "\u202e\u202d och emoji 🎉.bin"
+    st, _ = post([(höger, b"x")], token)
+    svar, _ = raw(b"GET /t/%s/status HTTP/1.0\r\n\r\n" % token.encode())
+    try:
+        json.loads(svar.split(b"\r\n\r\n", 1)[1])
+        giltig = True
+    except (ValueError, IndexError):
+        giltig = False
+    # json.dumps escapar icke-ASCII: den råa UTF-8-följden för U+202E får inte stå i
+    # svaret, den escapade formen ska göra det. Annars kan ett namn styra läsordningen.
+    rtl_rå = "\u202e".encode()
+    rtl_escapad = b"\\u202e"
+    check("abuse: RTL-läge och emoji i ett namn ger giltig JSON och escapad sida",
+          st == 200 and giltig and rtl_rå not in svar and rtl_escapad in svar,
+          "sparat %s, JSON %s, escapad %s" % (st, giltig, rtl_escapad in svar))
+
+    # --- /download: sökvägen, kön, och en klient som försvinner mitt i ---
+    with open(os.path.join(send_dir, "hämtbar.bin"), "wb") as fh:
+        fh.write(b"h" * 5000)
+    os.symlink(kanariefågel, os.path.join(send_dir, "länkad.bin"))
+    os.makedirs(os.path.join(send_dir, "en-katalog"), exist_ok=True)
+    svar, _ = raw(b"GET /t/%s/download/h%%C3%%A4mtbar.bin HTTP/1.0\r\n\r\n" % token.encode(), stop_after=200000)
+    check("abuse: en köad fil hämtas med hela kroppen", kod(svar) == 200 and svar.count(b"h") >= 5000, "kod %d" % kod(svar))
+    svar, _ = raw(b"GET /t/%s/download/../../etc/passwd HTTP/1.0\r\n\r\n" % token.encode())
+    check("abuse: traversal i hämtningen ger 404", kod(svar) == 404 and os.stat("/etc/passwd").st_mtime_ns == etc_före, "kod %d" % kod(svar))
+    svar, _ = raw(b"GET /t/%s/download/en-katalog HTTP/1.0\r\n\r\n" % token.encode())
+    check("abuse: en katalog i kön ger 404", kod(svar) == 404, "kod %d" % kod(svar))
+    svar, _ = raw(b"GET /t/%s/download/h%%00.bin HTTP/1.0\r\n\r\n" % token.encode())
+    check("abuse: NUL i hämtnamnet ger 404 utan krasch", kod(svar) == 404 and lever_efter(), "kod %d" % kod(svar))
+    svar, _ = raw(b"GET /t/%s/download/" % token.encode() + b"n" * 400 + b" HTTP/1.0\r\n\r\n", timeout=6)
+    check("abuse: ett 400 byte långt hämtnamn ger 404", kod(svar) in (0, 400, 404) and lever_efter(), "kod %d" % kod(svar))
+    svar, _ = raw(b"GET /t/%s/download/l%%C3%%A4nkad.bin HTTP/1.0\r\n\r\n" % token.encode())
+    check("abuse: en länk i kön följs till sin källa (det är kön)", kod(svar) == 200 and b"or" in svar, "kod %d" % kod(svar))
+    s = socket.create_connection(("127.0.0.1", port), timeout=6)
+    try:
+        s.sendall(b"GET /t/%s/download/stor-i-kon.bin HTTP/1.0\r\n\r\n" % token.encode())
+        s.recv(1024)
+    finally:
+        s.close()                       # klienten försvinner mitt i en nedladdning
+    time.sleep(0.7)
+    svar, _ = raw(b"GET /t/%s/status HTTP/1.0\r\n\r\n" % token.encode())
+    try:
+        status = json.loads(svar.split(b"\r\n\r\n", 1)[1])
+    except (ValueError, IndexError):
+        status = {}
+    check("abuse: en klient som försvinner mitt i lämnar ingen pågående överföring",
+          not status.get("active") and lever_efter(), str(status.get("active")))
+    check("abuse: status läcker ingen lokal sökväg till telefonen",
+          b"/home/" not in svar and tmp.encode() not in svar, "%d byte svar" % len(svar))
+
+    # --- /clip: texten, gränsen och att inget går via argv ---
+    svar, _ = raw(b"GET /t/%s/clip HTTP/1.0\r\n\r\n" % token.encode())
+    check("abuse: /clip utan delat urklipp svarar utan krasch", kod(svar) in (200, 204), "kod %d" % kod(svar))
+    rått = b"\xff\xfe\x00\x01 inte text"
+    svar, _ = raw(b"POST /t/%s/clip HTTP/1.0\r\nContent-Length: %d\r\n\r\n" % (token.encode(), len(rått)) + rått)
+    with open(os.path.join(tmp, "clip-stdin.txt"), "rb") as fh:
+        skickat = fh.read()
+    check("abuse: bytes som inte är text går till urklippet utan 500 och byte-identiskt",
+          kod(svar) in (200, 204) and rått in skickat, "kod %d, %d byte på stdin" % (kod(svar), len(skickat)))
+    svar, _ = raw(b"POST /t/%s/clip HTTP/1.0\r\nContent-Length: 0\r\n\r\n" % token.encode())
+    check("abuse: tom text till urklippet avvisas", kod(svar) == 400, "kod %d" % kod(svar))
+
+    # --- processer: namnet får aldrig hamna på en kommandorad ---
+    kanar = "argv-kanariefagel-DEADBEEF.bin"
+    post([(kanar, b"x")], token)
+    with open("/proc/%d/cmdline" % server_pid, "rb") as fh:
+        cmdline = fh.read()
+    med_argv = b""
+    for namn in ("clip-argv.txt", "notify-argv.txt"):
+        try:
+            with open(os.path.join(tmp, namn), "rb") as fh:
+                med_argv += fh.read()
+        except OSError:
+            pass
+    with open(os.path.join(tmp, "clip-stdin.txt"), "rb") as fh:
+        med_stdin = fh.read()
+    check("abuse: ett uppladdat namn hamnar aldrig på en kommandorad",
+          kanar.encode() not in cmdline and kanar.encode() not in med_argv and kanar.encode() not in med_stdin,
+          "cmdline %s, argv-loggar %s" % (kanar.encode() in cmdline, kanar.encode() in med_argv))
+
+    # --- tillståndsfiler: mode, ägare, och inga kvarlämningar ---
+    state = os.path.join(tmp, "sling")
+    fel_mode = []
+    for rot, under, filer in os.walk(state):
+        if stat.S_IMODE(os.stat(rot).st_mode) != 0o700:
+            fel_mode.append((rot, oct(stat.S_IMODE(os.stat(rot).st_mode))[-3:]))
+        for namn in filer:
+            p = os.path.join(rot, namn)
+            if stat.S_IMODE(os.stat(p).st_mode) != 0o600:
+                fel_mode.append((p, oct(stat.S_IMODE(os.stat(p).st_mode))[-3:]))
+    check("abuse: varje tillståndsfil är 0600 och varje katalog 0700", not fel_mode, str(fel_mode[:2]))
+    kända = {"token", "pid", "url", "qr.png", "server.log"}
+    kvar = [f for f in os.listdir(state) if f not in kända]
+    check("abuse: inga kvarlämningar i tillståndskatalogen", not kvar, str(kvar[:4]))
+    fel_mottagna = [f for f in os.listdir(received)
+                    if stat.S_IMODE(os.stat(os.path.join(received, f)).st_mode) != 0o600]
+    check("abuse: varje mottagen fil är 0600", not fel_mottagna, str(fel_mottagna[:3]))
+    os.symlink(kanariefågel, os.path.join(received, "planterad.bin"))
+    st, svarj = post([("planterad.bin", "övertramp".encode())], token)
+    with open(kanariefågel, "rb") as fh:
+        orörd = fh.read() == "orörd\n".encode()
+    check("abuse: en planterad länk skrivs inte igenom (O_EXCL tar nästa namn)",
+          st == 200 and orörd and os.path.islink(os.path.join(received, "planterad.bin"))
+          and svarj.get("saved") == ["planterad_1.bin"], "%s: %s, orörd %s" % (st, svarj.get("saved"), orörd))
+
+    # --- socketar: taket, deadlinen och att inget blir kvar ---
+    kontakter = []
+    for _ in range(200):
+        try:
+            kontakter.append(socket.create_connection(("127.0.0.1", port), timeout=3))
+        except OSError:
+            break
+    tak = int(os.environ.get("SLING_MAX_CONNECTIONS", "32"))
+    under_tradar, under_fds = fd_och_tradar()
+    for s in kontakter:
+        s.close()
+    for _ in range(30):
+        time.sleep(0.2)
+        efter_tradar, efter_fds = fd_och_tradar()
+        if efter_tradar <= före_tradar + 3:
+            break
+    check("abuse: 200 tysta anslutningar hålls under anslutningstaket",
+          under_tradar <= tak + 4, "%d trådar (tak %d)" % (under_tradar, tak))
+    check("abuse: ... och allt släpps tillbaka till vila",
+          efter_tradar <= före_tradar + 3 and efter_fds <= före_fds + 5,
+          "%d/%d mot %d/%d i vila" % (efter_tradar, efter_fds, före_tradar, före_fds))
+    kropp, ctype = multipart([("stannar.bin", os.urandom(100000))])
+    raw(("POST /t/%s/upload HTTP/1.0\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n"
+         % (token, ctype, len(kropp))).encode() + kropp[:5000], timeout=8)
+    check("abuse: en klient som stannar mitt i kroppen släpps av deadlinen",
+          "stannar.bin" not in katalog(received) and lever_efter())
+    svar, _ = raw(b"GET /t/%s/status HTTP/1.0\r\n\r\nGET /t/%s/status HTTP/1.0\r\n\r\n"
+                  % (token.encode(), token.encode()), stop_after=200000)
+    check("abuse: två begäranden i samma anslutning ger minst ett svar", kod(svar) == 200 and lever_efter(), "kod %d" % kod(svar))
+
+    # --- matrisen: vad som prövades här, vad den vanliga sviten bär, och vad som är n/a ---
+    prövade = h["counted"]["n"] - starträknare
+    rader = ["", "  Otillförlitlig yta: %d celler prövade i den här körningen" % prövade]
+    for ingång, (här, nere) in ABUSE_MATRIX.items():
+        rader.append("    %-18s prov: %s" % (ingång, här))
+        rader.append("    %-18s n/a:  %s" % ("", nere))
+    return "\n".join(rader)
+
 
 
 def main():
@@ -2747,11 +3162,13 @@ def main():
         sys.exit(cmd_clip())
     elif action == "send-pick":
         sys.exit(cmd_send_pick())
-    elif action == "selftest":
-        sys.exit(cmd_selftest())
+    elif action in ("selftest", "abuse"):
+        # abuse kör samma svit först och sedan den otillförlitliga ytan: en körning,
+        # en dom — allt som går att pröva utan att röra användarens filer.
+        sys.exit(cmd_selftest(abuse=(action == "abuse")))
     else:
         print("Usage: omarchy-sling [server | start | stop | status | open [send] | send <fil...> | "
-              "remove <fil...> | clear | clip | send-pick | copy [mdns] | selftest]")
+              "remove <fil...> | clear | clip | send-pick | copy [mdns] | selftest | abuse]")
         sys.exit(2)
 
 

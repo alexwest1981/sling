@@ -42,6 +42,30 @@ Verify a build at any time — `selftest` starts its own server on a spare port 
 omarchy-sling selftest
 ```
 
+`selftest` proves *behaviour*. `abuse` runs the same suite and then works the whole untrusted
+surface: every entry point — the token gate, the HTTP framing, the multipart body, file names,
+downloads, the clipboard in both directions, the phone page, the sockets, the state files and the
+process table — against every class a security review has ever filed against this plugin (bounds,
+identity, permissions, races, markup, `argv`/stdin, path, silent failure, lifecycle). Each cell is
+either tried or declared *not applicable* with its reason, and the run prints that matrix at the end,
+so an uncovered cell has to be stated rather than assumed:
+
+```
+  Otillförlitlig yta: 49 celler prövade i den här körningen
+    token/HTTP         prov: bounds, identitet, sökväg, tyst fel
+                       n/a:  markup, argv, rättigheter, race, livscykel: ingen data ur en förfrågan når en fil, en process eller en yta
+    /upload            prov: bounds, sökväg, rättigheter, tyst fel
+                       n/a:  markup, argv, identitet, race, livscykel: kroppen blir filer i en privat katalog, aldrig uppmärkning eller ett argument
+    ...
+```
+
+```bash
+omarchy-sling abuse        # samma svit, plus 49 skräpade celler — 145 kontroller
+```
+
+Everything runs against the suite's own server on a spare port in a scratch directory: nothing on
+your clipboard, nothing in `~/Downloads/Sling`, nothing on screen, and no traffic outside loopback.
+
 ---
 
 ## 🛠️ Installation
