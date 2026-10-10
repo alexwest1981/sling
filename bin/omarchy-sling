@@ -477,10 +477,42 @@ def generate_qr(url):
     return True
 
 
+def stale_publishers():
+    """Pidar för avahi-publicerare av VÅRT namn som inte är våra egna barn.
+
+    En server som dödats hårt (SIGKILL, OOM) lämnar sin publicerare kvar, och då
+    är namnet upptaget av en process som pekar på en dörr ingen öppnat: nästa
+    avahi-publish får ett annat namn (sling-2.local) medan panelen visar
+    sling.local. Mätt: en kvarglömd `avahi-publish-service -s sling _http._tcp
+    5399` levde vidare efter att servern dödats med -9, och ingenting lyssnade på
+    porten. Samma namn kan bara en publicera — den senaste starten vinner.
+    """
+    pids = []
+    for n in os.listdir("/proc"):
+        if not n.isdigit():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % n, "rb") as fh:
+                argv = fh.read().decode("utf-8", "replace").split("\0")
+        except OSError:
+            continue
+        if not any(os.path.basename(a) == "avahi-publish-service" for a in argv):
+            continue
+        if MDNS_NAME in argv:              # vår tjänst — inte någon annans
+            pids.append(int(n))
+    return pids
+
+
 def start_mdns():
     """Publicerar sling.local → den här datorn, en adress att minnas som
     överlever att DHCP byter IP. QR-koden använder ändå IP:t: Android löser
     inte .local pålitligt, och en QR som inte fungerar är värre än ett IP."""
+    for gammal in stale_publishers():
+        if gammal != os.getpid():
+            try:
+                os.kill(gammal, signal.SIGTERM)     # ta tillbaka namnet först
+            except OSError:
+                pass
     if not shutil.which("avahi-publish-service"):
         return None
     try:
@@ -1688,6 +1720,49 @@ def cmd_selftest():
         # avahi-publish-service som misslyckas direkt (skalet ovan) publiceras
         # ingenting — då får panelen inte visa http://sling.local.
         check("mDNS-adressen visas bara när den publiceras", st["mdns_url"] == "", repr(st["mdns_url"]))
+
+        # En server som dödats hårt lämnar sin avahi-publicerare kvar, och då är
+        # namnet upptaget av en adress som ingen lyssnar på. Mätt: en kvarglömd
+        # `avahi-publish-service -s sling _http._tcp 5399` levde vidare efter
+        # kill -9. start_mdns tar tillbaka namnet först.
+        gammalt_mdnsnamn = globals()["MDNS_NAME"]
+        globals()["MDNS_NAME"] = "sling-selftest-stale"
+        try:
+            sken_pub = os.path.join(tmp, "avahi-publish-service")
+            with open(sken_pub, "w") as fh:
+                # Ingen exec: kommandoraden ska behålla skriptnamnet, och när
+                # skalet får SIGTERM ska inget långlivat barn bli kvar.
+                fh.write("#!/bin/sh\nwhile :; do sleep 1; done\n")
+            os.chmod(sken_pub, 0o755)
+            kvarglömd = subprocess.Popen([sken_pub, "-s", globals()["MDNS_NAME"], "_http._tcp", "9"])
+            time.sleep(0.4)
+            check("kvarglömd publicerare av vårt namn pekas ut",
+                  kvarglömd.pid in stale_publishers(), "%s i %s" % (kvarglömd.pid, stale_publishers()))
+            # start_mdns() här i provprocessen får inte röra nätet: PATH riktas om
+            # till ett skal som misslyckas direkt, så ingen riktig avahi-publicerare
+            # startas (en kvarglömd sådan är hela poängen med provet).
+            gammal_path = os.environ.get("PATH", "")
+            tomt_skal = os.path.join(tmp, "tomt-skal")
+            os.makedirs(tomt_skal, exist_ok=True)
+            with open(os.path.join(tomt_skal, "avahi-publish-service"), "w") as fh:
+                fh.write("#!/bin/sh\nexit 1\n")
+            os.chmod(os.path.join(tomt_skal, "avahi-publish-service"), 0o755)
+            os.environ["PATH"] = tomt_skal
+            try:
+                start_mdns()                   # ska städa den och sedan ge upp
+            finally:
+                os.environ["PATH"] = gammal_path
+            kvar_pub = True
+            for _ in range(20):
+                kvar_pub = kvarglömd.poll() is None
+                if not kvar_pub:
+                    break
+                time.sleep(0.1)
+            check("  ... och start_mdns tar tillbaka namnet", not kvar_pub, "pid %d lever" % kvarglömd.pid)
+            if kvar_pub:
+                kvarglömd.kill()
+        finally:
+            globals()["MDNS_NAME"] = gammalt_mdnsnamn
         check("QR-koden skapas (qrencode via stdin)", st["qr_ok"] is True)
         check("status har active-nyckeln (None när inget pågår)", st.get("active") is None, str(st.get("active")))
 
