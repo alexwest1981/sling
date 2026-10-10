@@ -242,6 +242,8 @@ def human_size(size):
 
 
 def unique_path(directory, filename):
+    """Ledigt namn i katalogen. Används för kön (länkar), inte för uppladdningar:
+    den kontrollerar och öppnar i två steg, se create_unique."""
     dest = os.path.join(directory, filename)
     base, ext = os.path.splitext(filename)
     counter = 1
@@ -251,14 +253,48 @@ def unique_path(directory, filename):
     return dest
 
 
+def create_unique(directory, filename):
+    """Skapar filen och tar namnet i SAMMA syscall. Ger (namn, filhandtag).
+
+    unique_path frågade os.path.exists och öppnade sedan, så två samtidiga
+    uppladdningar med samma namn valde samma sökväg och skrev över varandra —
+    vilken fil som helst av dem kunde försvinna, medan båda svaren sa "saved".
+    Mätt: 12 samtidiga `samma.jpg` gav 7-10 filer på disk men 12 svar. O_EXCL gör
+    namnvalet och skapandet atomiskt: den som förlorar kapplöpningen får nästa
+    lediga namn i stället.
+    """
+    base, ext = os.path.splitext(filename)
+    counter = 0
+    while True:
+        name = filename if counter == 0 else "%s_%d%s" % (base, counter, ext)
+        try:
+            fd = os.open(os.path.join(directory, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        except FileExistsError:
+            counter += 1
+            continue
+        return name, os.fdopen(fd, "wb")
+
+
 def list_files(directory, limit=None):
+    """Filerna i katalogen, nyaste först. En fil som försvinner mitt i listningen
+    hoppas över i stället för att kasta: panelen pollar /status var 1,5 s medan
+    Alex rensar Received, och en förfrågan som dör utan svar syns ingenstans
+    (mätt: 3092 av 5634 /status-anrop försvann utan svar i en körning med en fil
+    som byttes ut hela tiden)."""
     if not os.path.isdir(directory):
         return []
-    names = [f for f in os.listdir(directory) if os.path.isfile(os.path.join(directory, f))]
-    names.sort(key=lambda f: os.path.getmtime(os.path.join(directory, f)), reverse=True)
+    filer = []
+    for f in os.listdir(directory):
+        path = os.path.join(directory, f)
+        try:
+            if os.path.isfile(path):
+                filer.append((f, os.path.getmtime(path), os.path.getsize(path)))
+        except OSError:
+            continue
+    filer.sort(key=lambda rad: rad[1], reverse=True)
     if limit:
-        names = names[:limit]
-    return [{"name": f, "size": human_size(os.path.getsize(os.path.join(directory, f)))} for f in names]
+        filer = filer[:limit]
+    return [{"name": f, "size": human_size(size)} for f, _, size in filer]
 
 
 def write_private(path, data):
@@ -314,39 +350,69 @@ def kill_source(proc, klar):
             pass
 
 
-def paste_bounded(*cmd):
-    """Läser en klippkälla med tak på både minne och tid. Ger (rc, data).
+def bounded_run(cmd, data=None, limit=None, timeout=None):
+    """Kör ett kommando i egen processgrupp med tak på tid OCH på hur mycket som
+    läses tillbaka. Ger (rc, utdata). `data` (bytes) skickas på stdin om den ges.
 
-    subprocess.run(capture_output=True) buffrar HELA strömmen i minnet innan
-    write_clip ens får se den, så en källa som strömmar utan slut äter upp
-    CLI-processens minne innan CLIP_MAX hinner verka. Här läses 64 KiB i taget tills
-    taket, källan dödas om den fortsätter, och en dödare stoppar en ägare som slutar
-    skriva utan att stänga fönstret (HANCORE, ärende 10821).
+    Tre saker måste hålla samtidigt, och de är samma fynd i tre steg (HANCORE,
+    ärende 10821):
+
+    * **Minne.** subprocess.run(capture_output=True) buffrar HELA strömmen innan
+      någon hinner se den, så en källa som strömmar utan slut äter upp
+      CLI-processens minne innan taket hinner verka. Här läses 64 KiB i taget
+      tills taket, och källan dödas om den fortsätter.
+    * **Tid.** En ägare som slutar skriva utan att stänga fönstret får inte hålla
+      kommandot — och på en förfrågningsväg (/status, /clip) får den inte hålla en
+      server-tråd för evigt: 32 sådana tar hela anslutningstaket.
+    * **Barnen.** wl-paste fork+exec:ar ett eget `cat`-barn som ärver vårt
+      stdout-rör. Att döda bara föräldern lämnar `cat` kvar med röret öppet, och
+      proc.stdout.read() står då kvar för evigt (mätt: blockerad >20 s efter att
+      vakthunden slagit till, med barnet kvar som process). Därför startas källan
+      i en egen processgrupp (start_new_session) och dödas som grupp.
+
+    Läses först efter att stdin är skriven och stängd, så ett kommando som skriver
+    mycket utdata inte kan låsa sig mot en skrivning i tur och ordning.
     """
+    timeout = CLIP_TIMEOUT if timeout is None else timeout
+    limit = CLIP_MAX if limit is None else limit
     klar = threading.Event()
-    proc = subprocess.Popen(list(cmd), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    proc = subprocess.Popen(list(cmd),
+                            stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                             start_new_session=True)
-    dodare = threading.Timer(CLIP_TIMEOUT, kill_source, (proc, klar))
+    dodare = threading.Timer(timeout, kill_source, (proc, klar))
     dodare.start()
     bitar, n = [], 0
     try:
-        while n <= CLIP_MAX:
+        if data is not None:
+            try:
+                proc.stdin.write(data)
+                proc.stdin.close()
+            except OSError:
+                pass
+        while n <= limit:
             bit = proc.stdout.read(65536)
             if not bit:
                 break
             bitar.append(bit)
             n += len(bit)
-        if n > CLIP_MAX:
+        if n > limit:
             kill_source(proc, klar)         # källan har mer — vi är klara ändå
         klar.set()
-        proc.wait(timeout=CLIP_TIMEOUT)
+        proc.wait(timeout=timeout)
     except (subprocess.TimeoutExpired, OSError):
         kill_source(proc, klar)
     finally:
         klar.set()
         dodare.cancel()
-    data = b"".join(bitar)[:CLIP_MAX]
-    return (0 if data else (proc.returncode or 1)), data
+    data_ut = b"".join(bitar)[:limit]
+    rc = 0 if data_ut else (proc.returncode if proc.returncode is not None else 1)
+    return rc, data_ut
+
+
+def paste_bounded(*cmd):
+    """wl-paste → sloten. Tunt skal över bounded_run: taken är urklippets."""
+    return bounded_run(list(cmd))
 
 
 def write_clip(text):
@@ -371,6 +437,11 @@ def generate_qr(url):
 
     URL:en (som bär token) går på qrencodes **stdin**, aldrig som argument: en
     annan lokal användare kan läsa argv ur processlistan och hade då fått token.
+    PNG:en kommer tillbaka på qrencodes stdout och skrivs med write_private, så
+    filen är 0600 redan när den skapas — förut skrev qrencode den själv genom
+    umask, och en efterföljande chmod har samma fönster som det tidigare fyndet
+    (HANCORE, ärende 10821). Körningen är takad: /status-vägen får inte kunna
+    hållas av en qrencode som inte blir klar.
     """
     try:
         with open(URL_FILE) as fh:
@@ -382,11 +453,11 @@ def generate_qr(url):
     if not shutil.which("qrencode"):
         log("qrencode saknas — ingen QR-kod kan skapas")
         return False
-    r = subprocess.run(["qrencode", "-s", "6", "-m", "2", "-o", QR_PATH],
-                       input=url.encode(), capture_output=True)
-    if r.returncode != 0 or not os.path.exists(QR_PATH):
-        log("qrencode misslyckades: " + (r.stderr or b"").decode("utf-8", "replace").strip())
+    rc, png = bounded_run(["qrencode", "-s", "6", "-m", "2", "-o", "-"], data=url.encode(), limit=1 << 20)
+    if rc != 0 or not png.startswith(b"\x89PNG"):
+        log("qrencode misslyckades (rc=%s, %d byte)" % (rc, len(png)))
         return False
+    write_private(QR_PATH, png)
     write_private(URL_FILE, url)
     return True
 
@@ -445,15 +516,25 @@ def stream_multipart(rfile, content_type, content_length, save_dir, on_progress=
 
     buf = b""
     remaining = content_length
-    out = None                      # (sökväg, filhandtag)
+    out = None                      # (namn, filhandtag)
     saved = []
     state = "preamble"              # preamble -> headers -> data -> headers ...
 
-    def close_part():
+    def close_part(behall=True):
+        """Stänger delen. behall=False kastar den i stället: en avbruten uppladdning
+        lämnade förut en halv fil i Received som såg hel ut (mätt: 599 863 av
+        2 000 139 byte, utan markering), och telefonen visste bara att anslutningen
+        dog."""
         nonlocal out
         if out:
             out[1].close()
-            saved.append(os.path.basename(out[0]))
+            if behall:
+                saved.append(out[0])
+            else:
+                try:
+                    os.remove(os.path.join(save_dir, out[0]))
+                except OSError:
+                    pass
             out = None
 
     def tell(nbytes=0, name=None):
@@ -461,7 +542,13 @@ def stream_multipart(rfile, content_type, content_length, save_dir, on_progress=
             on_progress(nbytes, name)
 
     while remaining > 0:
-        chunk = rfile.read(min(262144, remaining))
+        try:
+            chunk = rfile.read(min(262144, remaining))
+        except BaseException:
+            # Klienten försvann (eller slog i läsdeadlinen) mitt i en del: kasta
+            # den halva filen i stället för att lämna den som såg hel ut.
+            close_part(behall=False)
+            raise
         if not chunk:
             break
         remaining -= len(chunk)
@@ -495,8 +582,8 @@ def stream_multipart(rfile, content_type, content_length, save_dir, on_progress=
                 fn = re.search(r'filename="([^"]*)"', headers)
                 name = safe_upload_name(fn.group(1)) if fn else ""
                 if name:
-                    path = unique_path(save_dir, name)
-                    out = (path, open(path, "wb"))
+                    name, fh = create_unique(save_dir, name)
+                    out = (name, fh)
                     tell(0, name)
                 state = "data"
 
@@ -519,7 +606,8 @@ def stream_multipart(rfile, content_type, content_length, save_dir, on_progress=
                     return saved          # slutgräns
                 state = "headers"          # nästa dels rubriker ligger först i bufferten
 
-    close_part()
+    # Strömmen tog slut utan slutgräns: den sista delen är halv och kastas.
+    close_part(behall=False)
     return saved
 
 
@@ -841,9 +929,21 @@ class SlingHandler(BaseHTTPRequestHandler):
 
         elif rest.startswith("/download/"):
             name = os.path.basename(urllib.parse.unquote(rest[len("/download/"):]))
-            filepath = os.path.join(SEND_DIR, name)
-            if name and os.path.isfile(filepath):
-                size = os.path.getsize(filepath)
+            # Öppna först och mät sedan den inode vi faktiskt har: kön kan rensas
+            # eller filen bytas ut mellan en kontroll och öppnandet, och en
+            # Content-Length tagen från en annan inode ger klienten en halv kropp
+            # (samma klass som list_files — mätt: 3092 av 5634 anrop dog utan svar).
+            handtag = None
+            if name:
+                try:
+                    handtag = open(os.path.join(SEND_DIR, name), "rb")
+                except OSError:
+                    handtag = None
+            if handtag is None:
+                self._send(404)
+                return
+            with handtag:
+                size = os.fstat(handtag.fileno()).st_size
                 self.send_response(200)
                 self.send_header("Content-Type", "application/octet-stream")
                 # RFC 5987-formen klarar icke-ASCII och kan inte injicera rubriker.
@@ -852,16 +952,13 @@ class SlingHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 start_transfer("down", name, size)
                 try:
-                    with open(filepath, "rb") as fh:
-                        while chunk := fh.read(262144):   # färre väckningar per byte, mätt lika snabbt som 64 KB
-                            self.wfile.write(chunk)
-                            bump_transfer(len(chunk))
+                    while chunk := handtag.read(262144):   # färre väckningar per byte, mätt lika snabbt som 64 KB
+                        self.wfile.write(chunk)
+                        bump_transfer(len(chunk))
                 except (BrokenPipeError, ConnectionResetError):
                     log("avbruten nedladdning: %s" % name)
                 finally:
                     end_transfer()
-            else:
-                self._send(404)
 
         else:
             self._send(404)
@@ -890,7 +987,10 @@ class SlingHandler(BaseHTTPRequestHandler):
         if not shutil.which("wl-copy"):
             self._send(503, json.dumps({"ok": False, "error": "wl-copy missing"}).encode(), "application/json")
             return
-        if subprocess.run(["wl-copy"], input=text, check=False).returncode != 0:
+        # Takad körning: en wl-copy som inte blir klar får inte hålla en server-tråd
+        # för evigt — 32 sådana tar hela anslutningstaket och servern nekar alla.
+        rc, _ = bounded_run(["wl-copy"], data=text)
+        if rc != 0:
             self._send(500, json.dumps({"ok": False, "error": "wl-copy failed"}).encode(), "application/json")
             return
         # Notisen säger bara att något kommit — innehållet är privat metadata och
@@ -1071,8 +1171,7 @@ def cmd_server():
     _TOKEN = secrets.token_urlsafe(9)
     write_private(TOKEN_FILE, _TOKEN)      # token är hela gaten: 0600 från start
     url = server_url(_TOKEN)
-    with open(PID_FILE, "w") as fh:
-        fh.write(str(os.getpid()))
+    write_private(PID_FILE, str(os.getpid()))   # 0600 vid skapandet, som tokenfilen
 
     mdns = start_mdns()
     server = SlingServer(("0.0.0.0", PORT), SlingHandler)
@@ -1096,7 +1195,9 @@ def cmd_server():
         server.server_close()
         if mdns:
             mdns.terminate()
-        for path in (PID_FILE, TOKEN_FILE):
+        for path in (PID_FILE, TOKEN_FILE, URL_FILE, QR_PATH):
+            # URL-filen och QR-bilden bär samma token som tokenfilen; att städa bara
+            # två av fyra lämnade en kopia av token kvar i tillståndskatalogen.
             try:
                 os.remove(path)
             except OSError:
@@ -1318,8 +1419,9 @@ def cmd_selftest():
                SLING_BASE_DIR=tmp,
                SLING_IDLE_TIMEOUT="60",
                SLING_MAX_UPLOAD="2097152",            # 2 MB i provet
-               SLING_MAX_CONNECTIONS="8",             # taket prövas nedan
+               SLING_MAX_CONNECTIONS="16",            # taket prövas nedan (12 samtidiga i kapplöpningsprovet)
                SLING_SOCKET_TIMEOUT="3",
+               SLING_CLIP_TIMEOUT="1.5",              # provet för en hängande wl-copy
                XDG_RUNTIME_DIR=tmp,
                XDG_STATE_HOME=tmp,
                SLING_MDNS_NAME="sling-test")
@@ -1736,27 +1838,30 @@ def cmd_selftest():
         saved_paths = (globals()["QR_PATH"], globals()["URL_FILE"])
         globals()["QR_PATH"] = os.path.join(tmp, "qr-test.png")
         globals()["URL_FILE"] = os.path.join(tmp, "url-test")
-        seen = {"cmd": [], "input": None}
-        real_run = subprocess.run
+        seen = {"cmd": [], "data": None}
+        real_bounded = globals()["bounded_run"]
 
-        def spy(cmd, **kw):
+        def spy(cmd, data=None, limit=None, timeout=None):
             seen["cmd"] = list(cmd)
-            seen["input"] = kw.get("input")
-            return real_run(cmd, **kw)
+            seen["data"] = data
+            return 0, b"\x89PNG\r\n\x1a\n" + b"prov" * 40      # skenbar PNG ur skenbar qrencode
 
         try:
-            subprocess.run = spy
+            globals()["bounded_run"] = spy
             try:
                 qr_ok = generate_qr("http://10.0.0.9:5380/t/HEMLIG-TOKEN/")
             finally:
-                subprocess.run = real_run
+                globals()["bounded_run"] = real_bounded
         finally:
             globals()["QR_PATH"], globals()["URL_FILE"] = saved_paths
         joined = " ".join(seen["cmd"])
         check("QR skapas utan token i argv", qr_ok and "HEMLIG-TOKEN" not in joined,
               "argv: " + joined)
-        check("  ... URL:en går på stdin", seen["input"] == b"http://10.0.0.9:5380/t/HEMLIG-TOKEN/",
-              repr(seen["input"]))
+        check("  ... URL:en går på stdin", seen["data"] == b"http://10.0.0.9:5380/t/HEMLIG-TOKEN/",
+              repr(seen["data"]))
+        check("  ... och QR-filen skrivs 0600 av oss, inte av qrencode",
+              stat.S_IMODE(os.stat(os.path.join(tmp, "qr-test.png")).st_mode) == 0o600,
+              oct(stat.S_IMODE(os.stat(os.path.join(tmp, "qr-test.png")).st_mode))[-3:])
 
         # Samma skydd för kopieringen: wl-copy ska få URL:en på stdin, aldrig i argv.
         saved_token_file = globals()["TOKEN_FILE"]
@@ -1854,12 +1959,153 @@ def cmd_selftest():
         with urllib.request.urlopen("http://127.0.0.1:%d/t/%s/status" % (port, token), timeout=5) as r:
             after = json.loads(r.read()).get("active")
         check("active är tom igen efteråt", after is None, str(after))
+
+        # Namnet på en uppladdning väljs och filen skapas i SAMMA syscall
+        # (create_unique, O_EXCL). Förr frågade koden os.path.exists och öppnade
+        # sedan: två samtidiga uppladdningar med samma namn valde samma sökväg och
+        # skrev över varandra — mätt 12 samtidiga "samma.jpg" gav 7-10 filer på
+        # disk, medan alla tolv svaren sa "saved". Tyst dataförlust.
+        mottaget = os.path.join(tmp, "Received")
+        burst = 12
+        släpp = threading.Barrier(burst)
+        namn_svar = []
+
+        def skicka(i):
+            kropp, ctype = multipart([("samma.bin", bytes([65 + i]) * 120_000)])
+            req = urllib.request.Request("http://127.0.0.1:%d/t/%s/upload" % (port, token), data=kropp,
+                                         headers={"Content-Type": ctype}, method="POST")
+            släpp.wait()
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    namn_svar.extend(json.loads(r.read()).get("saved", []))
+            except Exception as exc:                    # noqa: BLE001 — provet rapporterar själv
+                namn_svar.append("FEL: %r" % exc)
+
+        trådar = [threading.Thread(target=skicka, args=(i,)) for i in range(burst)]
+        for t in trådar:
+            t.start()
+        for t in trådar:
+            t.join(60)
+        samma = [f for f in os.listdir(mottaget) if f.startswith("samma")]
+        hela = all(os.path.getsize(os.path.join(mottaget, f)) == 120_000 for f in samma)
+        check("samtidiga uppladdningar med samma namn får var sitt namn",
+              len(namn_svar) == burst and len(set(namn_svar)) == burst and len(samma) == burst and hela,
+              "%d svar, %d unika namn, %d filer i Received" % (len(namn_svar), len(set(namn_svar)), len(samma)))
+
+        # En klient som försvinner mitt i kroppen: den halva delen ska kastas, inte
+        # ligga kvar i Received som om den vore hel. Mätt förut: 599 863 av
+        # 2 000 139 byte låg kvar som "halv.bin", utan markering.
+        kropp, ctype = multipart([("halv.bin", b"H" * 400_000)])
+        skarv = socket.create_connection(("127.0.0.1", port), timeout=10)
+        skarv.sendall(("POST /t/%s/upload HTTP/1.1\r\nHost: sling\r\nContent-Type: %s\r\n"
+                       "Content-Length: %d\r\n\r\n" % (token, ctype, len(kropp))).encode() + kropp[:150_000])
+        time.sleep(0.4)
+        skarv.close()
+        time.sleep(0.6)
+        check("avbruten uppladdning lämnar ingen halv fil",
+              not os.path.exists(os.path.join(mottaget, "halv.bin")),
+              "halv.bin borta" if not os.path.exists(os.path.join(mottaget, "halv.bin"))
+              else "ligger kvar med %d byte" % os.path.getsize(os.path.join(mottaget, "halv.bin")))
+
+        # Panelen pollar /status var 1,5 s medan Alex rensar Received, och en
+        # nedladdning kan ryka mitt i. En fil som försvinner mellan listningen och
+        # stat-anropet fick förut förfrågan att dö utan svar — mätt 3092 av 5634
+        # /status-anrop. Ett 404 är ett svar; ett tyst avbrott är det inte.
+        for i in range(20):
+            with open(os.path.join(mottaget, "churn%d.bin" % i), "wb") as fh:
+                fh.write(b"x" * 4096)
+        slut = threading.Event()
+
+        def rör():
+            while not slut.is_set():
+                for i in range(20):
+                    try:
+                        os.remove(os.path.join(mottaget, "churn%d.bin" % i))
+                        with open(os.path.join(mottaget, "churn%d.bin" % i), "wb") as fh:
+                            fh.write(b"x" * 4096)
+                    except OSError:
+                        pass
+
+        threading.Thread(target=rör, daemon=True).start()
+        tysta, anrop = 0, 0
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 3:
+            for väg in ("status", "download/churn3.bin"):
+                anrop += 1
+                try:
+                    with urllib.request.urlopen("http://127.0.0.1:%d/t/%s/%s" % (port, token, väg), timeout=5) as r:
+                        r.read()
+                except urllib.error.HTTPError as e:
+                    if e.code != 404:
+                        tysta += 1
+                except Exception:                       # noqa: BLE001 — räknas som tyst svar
+                    tysta += 1
+        slut.set()
+        check("fil som försvinner mitt i listningen ger inget tyst svar", tysta == 0,
+              "%d av %d anrop utan svar" % (tysta, anrop))
+
+        pid_fil = os.path.join(tmp, "sling", "pid")
+        check("pid-filen skrivs 0600", stat.S_IMODE(os.stat(pid_fil).st_mode) == 0o600,
+              oct(stat.S_IMODE(os.stat(pid_fil).st_mode))[-3:])
+
+        # En wl-copy som aldrig blir klar: /clip-anropet ska få ett svar inom taket
+        # och inte lämna någon process kvar. Förut kördes wl-copy utan tak, så en
+        # server-tråd per anrop låg kvar för alltid — 32 av dem tar hela
+        # anslutningstaket och servern nekar alla. Skenet skriver sina egna pidar
+        # till en fil, så provet pekar ut exakt de processerna (att leta i /proc
+        # efter namn kan träffa någon annans kommandorad).
+        häng_pidfil = os.path.join(tmp, "hang.pid")
+        with open(os.path.join(shim, "wl-copy"), "w") as fh:
+            fh.write("#!/bin/sh\nsleep 4317 &\necho \"$$ $!\" > '%s'\nexec sleep 4317\n" % häng_pidfil)
+        os.chmod(os.path.join(shim, "wl-copy"), 0o755)
+        t0 = time.monotonic()
+        kod = None
+        try:
+            req = urllib.request.Request("http://127.0.0.1:%d/t/%s/clip" % (port, token),
+                                         data=b"text som aldrig kommer fram", method="POST")
+            with urllib.request.urlopen(req, timeout=30) as r:
+                kod = r.status
+        except urllib.error.HTTPError as e:
+            kod = e.code
+        except Exception as exc:                      # noqa: BLE001 — tidsgräns eller tyst avbrott
+            kod = repr(exc)
+        hängde = time.monotonic() - t0
+        with open(os.path.join(shim, "wl-copy"), "w") as fh:
+            fh.write('printf "%%s\\n" "$*" >> "%s"\ncat > "%s"\n' % (clip_argv, clip_out))
+        os.chmod(os.path.join(shim, "wl-copy"), 0o755)
+        check("hängande wl-copy ger svar inom taket", kod == 500 and hängde < 10,
+              "%s efter %.1f s" % (kod, hängde))
+        try:
+            with open(häng_pidfil) as fh:
+                häng_pidar = [int(p) for p in fh.read().split()]
+        except (OSError, ValueError):
+            häng_pidar = []
+        kvar = []
+        for _ in range(20):                       # hinner skördas innan domen
+            kvar = [p for p in häng_pidar if lever(p)]
+            if not kvar:
+                break
+            time.sleep(0.1)
+        check("  ... och lämnar ingen process kvar", len(häng_pidar) == 2 and not kvar,
+              "%d pidar, kvar: %s" % (len(häng_pidar), kvar))
+        for p in kvar:                            # städa efter ett underkänt prov
+            try:
+                os.kill(p, signal.SIGKILL)
+            except OSError:
+                pass
     finally:
         proc.terminate()
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
+        # Vid avväpning städas token, pid, URL och QR. URL-filen och QR-bilden bär
+        # samma token som tokenfilen; förut städades bara två av fyra, så en kopia
+        # av token låg kvar i tillståndskatalogen.
+        kvar_i_tillstand = sorted(os.listdir(os.path.join(tmp, "sling")))
+        check("avväpningen städar token, pid, URL och QR",
+              not [n for n in kvar_i_tillstand if n.startswith(("token", "pid", "url", "qr"))],
+              str(kvar_i_tillstand))
         shutil.rmtree(tmp, ignore_errors=True)
 
     print("\n%d kontroller, %d misslyckade" % (counted["n"], len(failures)))
