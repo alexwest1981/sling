@@ -1166,15 +1166,29 @@ def server_status(token):
 # Kommandon
 # ------------------------------------------------------------------------------
 def cmd_server():
+    """Startar servern. Porten tas INNAN något skrivs till tillståndskatalogen.
+
+    Två samtidiga `start` (dubbelklick i panelen) skrev förut båda sin token, och
+    den som förlorade kampen om porten dog på "Address already in use" — kvar stod
+    panelens URL och QR med en token som den körande servern nekar (mätt: HTTP 403
+    mot token i filen medan servern svarade), och förlorarens städning kunde radera
+    den körandes pid-, token-, URL- och QR-filer. Binda först: den som inte får
+    porten har inget att skriva över och lämnar ett begripligt felmeddelande.
+    """
     global _TOKEN, IS_SERVER
     IS_SERVER = True
     _TOKEN = secrets.token_urlsafe(9)
-    write_private(TOKEN_FILE, _TOKEN)      # token är hela gaten: 0600 från start
-    url = server_url(_TOKEN)
-    write_private(PID_FILE, str(os.getpid()))   # 0600 vid skapandet, som tokenfilen
+    try:
+        server = SlingServer(("0.0.0.0", PORT), SlingHandler)
+    except OSError as exc:
+        print("Sling: kan inte ta port %d (%s) — kör redan en server?" % (PORT, exc),
+              file=sys.stderr)
+        return 1
 
+    url = server_url(_TOKEN)
+    write_private(TOKEN_FILE, _TOKEN)      # token är hela gaten: 0600 från start
+    write_private(PID_FILE, str(os.getpid()))   # 0600 vid skapandet, som tokenfilen
     mdns = start_mdns()
-    server = SlingServer(("0.0.0.0", PORT), SlingHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     qr_ok = generate_qr(url)
     log("lyssnar på 0.0.0.0:%d, mDNS=%s, qr_ok=%s" % (PORT, bool(mdns), qr_ok))
@@ -1195,13 +1209,18 @@ def cmd_server():
         server.server_close()
         if mdns:
             mdns.terminate()
-        for path in (PID_FILE, TOKEN_FILE, URL_FILE, QR_PATH):
-            # URL-filen och QR-bilden bär samma token som tokenfilen; att städa bara
-            # två av fyra lämnade en kopia av token kvar i tillståndskatalogen.
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+        # Städa bara det som fortfarande är vårt: har en annan server tagit över
+        # tillståndskatalogen är filerna dess, och att radera dem vore att slå ut
+        # en körande server.
+        if filmnehall(TOKEN_FILE) == _TOKEN:
+            for path in (PID_FILE, TOKEN_FILE, URL_FILE, QR_PATH):
+                # URL-filen och QR-bilden bär samma token som tokenfilen; att städa
+                # bara två av fyra lämnade en kopia av token kvar i katalogen.
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+    return 0
 
 
 def cmd_start():
@@ -1212,8 +1231,15 @@ def cmd_start():
         subprocess.Popen([sys.executable, os.path.abspath(__file__), "server"],
                          stdout=logfh, stderr=logfh, start_new_session=True)
     for _ in range(50):                     # upp till ~5 s
-        if port_open():
-            print("Sling started: %s" % server_url(read_token()))
+        token = read_token()
+        # Tre saker måste stämma innan vi påstår att servern är uppe: porten lyssnar,
+        # tokenfilen är skriven (servern tar porten först och skriver sedan), och
+        # servern SVARAR på just den token. Annars kunde panelen visa en URL och QR
+        # som den körande servern nekar — eller en tom token, om vi läste filen i
+        # fönstret mellan bind och skrivning (mätt: två samtidiga `start` gav HTTP 403
+        # mot token i filen). Ett främmande program på porten ger samma svar: inte uppe.
+        if port_open() and token and server_status(token):
+            print("Sling started: %s" % server_url(token))
             return 0
         time.sleep(0.1)
     print("Sling did not come up — se %s" % LOG_PATH, file=sys.stderr)
@@ -1226,7 +1252,7 @@ def pid_is_our_server(pid):
     pid-filen ligger i en privat katalog, men en pid ur en fil är inget att lita på:
     vi läser /proc/<pid>/cmdline och kräver vårt skriptnamn och "server"-argumentet,
     och vägrar pida oss själva eller pid 1. En främmande pid nekas i stället för att
-    dödas — oavsett vem som skrev filen.
+    dödas — oavsett vem som skrev den.
     """
     if pid <= 1 or pid == os.getpid():
         return False
@@ -1236,6 +1262,26 @@ def pid_is_our_server(pid):
     except OSError:
         return False
     return "server" in argv and any(os.path.basename(a) == "omarchy-sling" for a in argv)
+
+
+def server_pids():
+    """Pidarna för våra egna serverprocesser, hittade genom att fråga /proc.
+
+    Aldrig genom att matcha en sträng: `pkill -f "omarchy-sling server"` dödade en
+    process vars kommandorad bara nämnde texten (mätt: ett skal med strängen i en
+    kommentar — samma klass som fyndet om en pid ur en fil). Här prövas varje pid
+    med pid_is_our_server först.
+    """
+    return [int(n) for n in os.listdir("/proc") if n.isdigit() and pid_is_our_server(int(n))]
+
+
+def filmnehall(path):
+    """Filens innehåll, utan radbrytning — eller None om den inte går att läsa."""
+    try:
+        with open(path) as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
 
 
 def cmd_stop():
@@ -1248,14 +1294,20 @@ def cmd_stop():
     if pid and pid_is_our_server(pid):
         try:
             os.kill(pid, signal.SIGTERM)
-            for _ in range(30):
-                if not port_open():
-                    break
-                time.sleep(0.1)
         except OSError:                 # försvann, eller inte vår att signalera
             pass
     if port_open():
-        subprocess.run(["pkill", "-f", "omarchy-sling server"], check=False)
+        # Fallback när pid-filen saknas eller pekar fel: leta upp våra egna
+        # serverprocesser och pröva var och en innan den signaleras.
+        for annan in server_pids():
+            try:
+                os.kill(annan, signal.SIGTERM)
+            except OSError:
+                pass
+    for _ in range(30):                 # upp till ~3 s på att porten stängs
+        if not port_open():
+            break
+        time.sleep(0.1)
     print("Sling stopped.")
     return 0
 
@@ -2106,6 +2158,78 @@ def cmd_selftest():
         check("avväpningen städar token, pid, URL och QR",
               not [n for n in kvar_i_tillstand if n.startswith(("token", "pid", "url", "qr"))],
               str(kvar_i_tillstand))
+
+        # Start och stopp, i egen port och egen katalog (selftestens egen server är
+        # redan nere, så inget här kan röra den). Två samtidiga `start` — som ett
+        # dubbelklick i panelen — skrev förut båda sin token och den som förlorade
+        # porten dog på "Address already in use": kvar stod panelens URL och QR med
+        # en token som den körande servern nekar (mätt: HTTP 403), och förlorarens
+        # städning kunde radera den körandes filer.
+        sub = os.path.join(tmp, "sub")
+        os.makedirs(os.path.join(sub, "run"), exist_ok=True)
+        sub_port = port + 1
+        sub_state = os.path.join(sub, "run", "sling")
+        sub_env = dict(env, SLING_PORT=str(sub_port), SLING_BASE_DIR=sub,
+                       XDG_RUNTIME_DIR=os.path.join(sub, "run"), XDG_STATE_HOME=sub)
+        starter = []
+
+        def starta():
+            starter.append(subprocess.run([sys.executable, os.path.abspath(__file__), "start"],
+                                          env=sub_env, capture_output=True, text=True, timeout=60))
+
+        trådar = [threading.Thread(target=starta) for _ in range(2)]
+        for t in trådar:
+            t.start()
+        for t in trådar:
+            t.join(60)
+        try:
+            with open(os.path.join(sub_state, "token")) as fh:
+                sub_token = fh.read().strip()
+        except OSError:
+            sub_token = ""
+        sub_svar = None
+        if sub_token:
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:%d/t/%s/status" % (sub_port, sub_token), timeout=5) as r:
+                    sub_svar = r.status
+            except Exception:                     # noqa: BLE001 — räknas som "svarar inte"
+                sub_svar = None
+        sub_filer = sorted(os.listdir(sub_state)) if os.path.isdir(sub_state) else []
+        check("två samtidiga start lämnar en token som den körande servern tar",
+              sub_svar == 200 and all(f in sub_filer for f in ("token", "pid", "url", "qr.png")),
+              "status=%s, filer=%s" % (sub_svar, sub_filer))
+
+        # Stopp: fallbacken fick förut döda vilken process som helst vars kommandorad
+        # nämnde "omarchy-sling server" (mätt: ett skal med texten i en kommentar).
+        # Provet prövar urvalet, inte signalen, så inget annat än selftestens egen
+        # sub-server kan komma i fråga.
+        oskyldig = subprocess.Popen(["bash", "-c", "while :; do sleep 1; done  # omarchy-sling server"])
+        time.sleep(0.4)
+        try:
+            with open(os.path.join(sub_state, "pid")) as fh:
+                sub_pid = int(fh.read().strip())
+        except (OSError, ValueError):
+            sub_pid = 0
+        egna = server_pids()
+        check("vår egen server pekas ut för stopp", sub_pid in egna, "%s i %s" % (sub_pid, egna))
+        check("främmande process med vår sträng i kommandoraden pekas inte ut",
+              oskyldig.pid not in egna, "oskyldig %d, egna %s" % (oskyldig.pid, egna))
+
+        # och stoppet stänger sub-servern (pid-vägen, som är den vanliga)
+        stopp = subprocess.run([sys.executable, os.path.abspath(__file__), "stop"], env=sub_env,
+                               capture_output=True, text=True, timeout=60)
+        time.sleep(0.6)
+        sub_nere = True
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:%d/t/%s/status" % (sub_port, sub_token), timeout=3) as r:
+                sub_nere = False
+        except Exception:                         # noqa: BLE001 — nere är det väntade
+            pass
+        check("stop stänger sub-servern", sub_nere and "stopped" in (stopp.stdout + stopp.stderr).lower(),
+              (stopp.stdout + stopp.stderr).strip()[:40])
+        check("  ... och den oskyldiga processen lever fortfarande", lever(oskyldig.pid),
+              "oskyldig %d" % oskyldig.pid)
+        oskyldig.kill()
         shutil.rmtree(tmp, ignore_errors=True)
 
     print("\n%d kontroller, %d misslyckade" % (counted["n"], len(failures)))
@@ -2119,7 +2243,7 @@ def cmd_selftest():
 def main():
     action = sys.argv[1] if len(sys.argv) > 1 else "status"
     if action == "server":
-        cmd_server()
+        sys.exit(cmd_server() or 0)
     elif action == "start":
         sys.exit(cmd_start())
     elif action == "stop":
