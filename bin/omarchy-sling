@@ -119,6 +119,13 @@ def start_transfer(direction, name, total):
 
 def bump_transfer(nbytes):
     ACTIVE["done"] += nbytes
+    # En pågående överföring är trafik. Avväpningstimern räknade bara förfrågningar,
+    # så en överföring som tog längre tid än SLING_IDLE_TIMEOUT kapades mitt i —
+    # mätt med taket satt till 2 s: BrokenPipe efter 3,6 s och ingen fil på disk.
+    # Panelen håller timern levande med sin poll, men en server startad som
+    # `omarchy-sling start` i en terminal har ingen poll. En klient som slutar
+    # skicka bumpar inte längre, så taket gäller fortfarande för en tyst transfer.
+    LAST_ACTIVITY["t"] = time.monotonic()
 
 
 def end_transfer():
@@ -1205,7 +1212,14 @@ def cmd_server():
     signal.signal(signal.SIGTERM, bye)
     signal.signal(signal.SIGINT, bye)
     try:
-        while time.monotonic() - LAST_ACTIVITY["t"] <= IDLE_TIMEOUT:
+        while (time.monotonic() - LAST_ACTIVITY["t"] <= IDLE_TIMEOUT
+               # En pågående överföring är trafik även när ingen bit hunnit läsas
+               # klart: läsetningen är girig (upp till 256 KiB), så en långsam klient
+               # ger inga avbrott emellan. Mätt med taket satt till 2 s: en överföring
+               # kapades efter 3,6 s. En klient som slutar skicka fastnar i
+               # läsdeadlinen (SOCKET_TIMEOUT) och då nollas ACTIVE, så taket gäller
+               # fortfarande för en död transfer.
+               or ACTIVE["dir"]):
             time.sleep(2)
         log("ingen trafik på %ds — avväpnar" % IDLE_TIMEOUT)
     except (KeyboardInterrupt, SystemExit):
@@ -1369,10 +1383,25 @@ def cmd_send(paths):
             continue
         if os.path.exists(dest):
             dest = unique_path(SEND_DIR, os.path.basename(src))
-        try:
-            os.symlink(src, dest)
-        except OSError:
-            shutil.copy2(src, dest)
+        while True:
+            try:
+                os.symlink(src, dest)
+                break
+            except FileExistsError:
+                # Namnet togs mellan kontrollen och länken — två samtidiga `send`
+                # med samma basnamn från olika mappar. Det fallet gick förut vidare
+                # till shutil.copy2, som FÖLJER en länk och skriver in i filen den
+                # pekar på: mätt skrev 9 av 60 samtidiga par över en källfil, och
+                # telefonen laddade sedan ner fel innehåll. Ta nästa lediga namn.
+                dest = unique_path(SEND_DIR, os.path.basename(src))
+            except OSError:
+                # Filsystem utan länkar: kopiera — men aldrig över något som redan
+                # ligger i kön, för en länk dit är en skrivning in i källfilen.
+                if os.path.exists(dest):
+                    dest = unique_path(SEND_DIR, os.path.basename(src))
+                    continue
+                shutil.copy2(src, dest)
+                break
         print(dest)
         count += 1
     return 0 if count else 1
@@ -1666,6 +1695,44 @@ def cmd_selftest():
                 fh.write("annat innehåll")
             cmd_send([doc2])
             check("annan fil med samma namn får _1", os.path.exists(os.path.join(test_send, "fil1_1.txt")))
+
+            # Kapplöpningen i kön: namnet tas av en annan samtidig `send` mellan
+            # kontrollen och länken. Det fallet gick förut vidare till shutil.copy2,
+            # som FÖLJER en länk och skriver in i filen den pekar på — mätt skrev 9 av
+            # 60 samtidiga par med samma basnamn över en källfil, och telefonen laddade
+            # sedan ner fel innehåll. Här tvingas exakt det ögonblicket fram: länken
+            # finns redan när cmd_send försöker skapa den.
+            offer = os.path.join(other, "kollision.txt")
+            with open(offer, "w") as fh:
+                fh.write("ORIGINAL")
+            inkorg = os.path.join(tmp, "inkommande")
+            os.makedirs(inkorg, exist_ok=True)
+            inkommande = os.path.join(inkorg, "kollision.txt")
+            with open(inkommande, "w") as fh:
+                fh.write("INKOMMANDE")
+            riktig_symlink = os.symlink
+            första = []
+
+            def falsk_symlink(src, dst, **kw):
+                if not första:                     # bara första försöket kolliderar
+                    första.append(dst)
+                    riktig_symlink(inkommande, dst)
+                    raise FileExistsError(17, "File exists")
+                return riktig_symlink(src, dst, **kw)
+
+            os.symlink = falsk_symlink
+            try:
+                cmd_send([offer])
+            finally:
+                os.symlink = riktig_symlink
+            with open(offer) as fh:
+                kvar_offer = fh.read()
+            with open(inkommande) as fh:
+                kvar_inkommande = fh.read()
+            kön = sorted(f for f in os.listdir(test_send) if f.startswith("kollision"))
+            check("namnkollision i kön skriver inte in i en källfil",
+                  kvar_offer == "ORIGINAL" and kvar_inkommande == "INKOMMANDE" and len(kön) == 2,
+                  "%r/%r, kön: %s" % (kvar_offer, kvar_inkommande, kön))
 
             doc3 = os.path.join(tmp, "dod.txt")
             with open(doc3, "w") as fh:
@@ -1999,6 +2066,14 @@ def cmd_selftest():
               and seen["total"] == len(body) and 0 < seen["pct"] < 100, str(seen and seen.get("pct")))
         check("  ... och en fart i byte/s", bool(seen) and seen["speed"] > 0, str(seen and round(seen.get("speed", 0))))
 
+        # Varje läst bit ska räknas som aktivitet: avväpningstimern tittar bara på
+        # LAST_ACTIVITY, så utan det stod klockan still under en överföring.
+        före_aktivitet = LAST_ACTIVITY["t"]
+        time.sleep(0.05)
+        bump_transfer(1)
+        check("varje överförd bit räknas som aktivitet", LAST_ACTIVITY["t"] > före_aktivitet,
+              "%.3f -> %.3f" % (före_aktivitet, LAST_ACTIVITY["t"]))
+
         # Panelens egen väg: `omarchy-sling status` (CLI) måste visa samma pågående
         # överföring — den finns bara i serverprocessens minne och läses ur /status.
         cli = subprocess.run([sys.executable, os.path.abspath(__file__), "status"],
@@ -2284,6 +2359,69 @@ def cmd_selftest():
         check("  ... och den oskyldiga processen lever fortfarande", lever(oskyldig.pid),
               "oskyldig %d" % oskyldig.pid)
         oskyldig.kill()
+
+        # Avväpningstimern räknade bara förfrågningar, inte pågående överföring: en
+        # transfer som tar längre tid än SLING_IDLE_TIMEOUT kapades mitt i (mätt med
+        # taket satt till 2 s: BrokenPipe efter 3,6 s och ingen fil på disk). Panelen
+        # håller timern levande med sin poll, men en server startad som
+        # `omarchy-sling start` i en terminal har ingen poll. Nu räknas varje läst bit.
+        långsam = os.path.join(tmp, "langsam")
+        os.makedirs(os.path.join(långsam, "run"), exist_ok=True)
+        långsam_port = port + 2
+        långsam_state = os.path.join(långsam, "run", "sling")
+        långsam_env = dict(env, SLING_PORT=str(långsam_port), SLING_BASE_DIR=långsam,
+                           XDG_RUNTIME_DIR=os.path.join(långsam, "run"), XDG_STATE_HOME=långsam,
+                           SLING_IDLE_TIMEOUT="2")
+        långsam_srv = subprocess.Popen([sys.executable, os.path.abspath(__file__), "server"],
+                                       env=långsam_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            långsam_token = ""
+            for _ in range(80):
+                try:
+                    with open(os.path.join(långsam_state, "token")) as fh:
+                        långsam_token = fh.read().strip()
+                except OSError:
+                    långsam_token = ""
+                if långsam_token:
+                    break
+                time.sleep(0.05)
+            gräns = "----langsam"
+            huvud = ("--%s\r\nContent-Disposition: form-data; name=\"files\"; filename=\"langsam.bin\"\r\n"
+                     "Content-Type: application/octet-stream\r\n\r\n" % gräns).encode()
+            slut = ("\r\n--%s--\r\n" % gräns).encode()
+            bit = b"L" * (32 * 1024)
+            antal = 8
+            längd = len(huvud) + antal * len(bit) + len(slut)
+            skarv = socket.create_connection(("127.0.0.1", långsam_port), timeout=10)
+            skarv.sendall(("POST /t/%s/upload HTTP/1.1\r\nHost: sling\r\nContent-Type: multipart/form-data; "
+                           "boundary=%s\r\nContent-Length: %d\r\n\r\n"
+                           % (långsam_token, gräns, längd)).encode() + huvud)
+            t0 = time.monotonic()
+            överföringsfel = None
+            långsam_svar = b""
+            try:
+                for _ in range(antal):
+                    skarv.sendall(bit)
+                    time.sleep(0.5)                # ~4 s, längre än taket på 2 s
+                skarv.sendall(slut)
+                skarv.settimeout(10)
+                långsam_svar = skarv.recv(40)
+            except Exception as exc:               # noqa: BLE001 — avbrottet är fyndet
+                överföringsfel = repr(exc)
+            tid = time.monotonic() - t0
+            skarv.close()
+            långsam_fil = os.path.join(långsam, "Received", "langsam.bin")
+            check("avväpningstimern ser en pågående överföring",
+                  överföringsfel is None and b"200" in långsam_svar and os.path.exists(långsam_fil)
+                  and os.path.getsize(långsam_fil) == antal * len(bit),
+                  "%s efter %.1f s, fil: %s" % (överföringsfel or långsam_svar[:16], tid,
+                                                os.path.getsize(långsam_fil) if os.path.exists(långsam_fil) else "saknas"))
+        finally:
+            långsam_srv.terminate()
+            try:
+                långsam_srv.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                långsam_srv.kill()
         shutil.rmtree(tmp, ignore_errors=True)
 
     print("\n%d kontroller, %d misslyckade" % (counted["n"], len(failures)))
