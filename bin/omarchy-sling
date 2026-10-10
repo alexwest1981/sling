@@ -20,6 +20,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -235,18 +236,35 @@ def list_files(directory, limit=None):
 
 
 def write_private(path, data):
-    """Skriver en fil med 0600 redan vid skapandet.
+    """Skriver en fil med 0600 i en NY inode, atomiskt.
 
-    open() följt av chmod lämnar ett fönster där filen är läsbar för andra lokala
-    konton (umask 022 → 0644) innan mode sätts — den som hinner öppna den behåller
-    åtkomsten efter chmod. O_CREAT med mode stänger fönstret, och O_NOFOLLOW hindrar
-    en planterad symlink på platsen från att styra skrivningen. Ersätter
-    open()+chmod för urklippsloten, tokenfilen och URL-filen (HANCORE, ärende 10821).
+    Tre saker måste hålla samtidigt, och de är samma fynd i tre steg (HANCORE,
+    ärende 10821):
+
+    * **Mode vid skapandet.** open() ger 0666 & ~umask (0644 med umask 022), och den
+      som hinner öppna filen behåller åtkomsten efter en efterföljande chmod.
+    * **Ny inode varje gång.** Att skriva om en befintlig fil (O_TRUNC) låter en
+      process som öppnade den under det gamla läsbara fönstret läsa allt som skrivs
+      dit i framtiden — hur fina mode än är efteråt. Därför skrivs varje urklipp,
+      token och URL till en helt ny fil.
+    * **Atomiskt byte.** Skrivningen sker i samma katalog och byter namn över den
+      gamla, så en läsare ser antingen den förra eller den nya filen, aldrig en halv.
+
+    tempfile.mkstemp skapar redan med 0600 och ett namn ingen annan kan gissa.
     """
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(data.encode() if isinstance(data, str) else data)
-    os.chmod(path, 0o600)                   # rättar en fil skapad av en äldre version
+    mapp = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=mapp, prefix="." + os.path.basename(path) + ".")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data.encode() if isinstance(data, str) else data)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)               # ny inode tar över namnet; gamla läsare tappar
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def write_clip(text):
@@ -1416,6 +1434,28 @@ def cmd_selftest():
         with urllib.request.urlopen("http://127.0.0.1:%d/t/%s/clip" % (port, token), timeout=5) as r:
             served = r.read().decode()
         check("telefonen hämtar sloten via /clip", served == shared, repr(served[:24]))
+
+        # HANCORE:s tredje fynd: en process som öppnade sloten under det gamla läsbara
+        # fönstret får inte kunna läsa framtida urklipp. Det håller bara om varje
+        # skrivning sker till en NY inode — att skriva om filen (O_TRUNC) lämnar kvar
+        # den gamla läsarens åtkomst. Provet öppnar sloten, skriver igen och ser att
+        # den gamla beskrivningen inte följer med.
+        sparad_slot = globals()["CLIP_PATH"]
+        globals()["CLIP_PATH"] = clip_slot
+        try:
+            with open(clip_slot, "rb") as gammal_lasare:
+                inode_fore = os.stat(clip_slot).st_ino
+                nytt_urklipp = "nytt urklipp på ny inode ✓".encode()
+                write_clip(nytt_urklipp)
+                inode_efter = os.stat(clip_slot).st_ino
+                check("ny skrivning ger ny inode (gammal läsare tappar åtkomsten)",
+                      inode_efter != inode_fore, "%d -> %d" % (inode_fore, inode_efter))
+                check("... och den gamla läsaren ser inte det nya urklippet",
+                      gammal_lasare.read() != nytt_urklipp)
+                with open(clip_slot, "rb") as fh:
+                    check("... men sloten bär det nya urklippet", fh.read() == nytt_urklipp)
+        finally:
+            globals()["CLIP_PATH"] = sparad_slot
 
         clip_text = "text från telefonen ✓".encode()
         req = urllib.request.Request("http://127.0.0.1:%d/t/%s/clip" % (port, token), data=clip_text,
