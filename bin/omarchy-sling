@@ -17,6 +17,7 @@ import secrets
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -53,11 +54,17 @@ TOKEN_FILE = os.path.join(STATE_DIR, "token")
 LOG_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "sling")
 LOG_PATH = os.path.join(LOG_DIR, "server.log")
 
-for _d in (RECEIVED_DIR, SEND_DIR, STATE_DIR, LOG_DIR):
-    # 0700: loggen namnger mottagna filer — ingen annan lokal användare ska kunna läsa den.
+DEFAULT_BASE = os.path.join(os.path.expanduser("~"), "Downloads", "Sling")
+for _d in (BASE_DIR, RECEIVED_DIR, SEND_DIR, STATE_DIR, LOG_DIR):
+    # 0700: loggen namnger mottagna filer, och urklippsloten ligger direkt i basen —
+    # ingen annan lokal användare ska kunna läsa eller gå igenom dem.
     os.makedirs(_d, mode=0o700, exist_ok=True)
-    if _d in (STATE_DIR, LOG_DIR):
-        # Redan skapade kataloger behåller sin gamla mode; sätt om varje gång.
+    # Redan skapade kataloger behåller sin gamla mode; sätt om varje gång. Bara den
+    # egna basen tvingas: pekar SLING_BASE_DIR någon annanstans (en delad katalog) är
+    # det användarens val, och att chmodda den vore att ändra något vi inte äger.
+    _hard = (_d == DEFAULT_BASE or _d.startswith(DEFAULT_BASE + os.sep)
+             or _d in (STATE_DIR, LOG_DIR))
+    if _hard:
         try:
             os.chmod(_d, 0o700)
         except OSError:
@@ -227,12 +234,25 @@ def list_files(directory, limit=None):
     return [{"name": f, "size": human_size(os.path.getsize(os.path.join(directory, f)))} for f in names]
 
 
+def write_private(path, data):
+    """Skriver en fil med 0600 redan vid skapandet.
+
+    open() följt av chmod lämnar ett fönster där filen är läsbar för andra lokala
+    konton (umask 022 → 0644) innan mode sätts — den som hinner öppna den behåller
+    åtkomsten efter chmod. O_CREAT med mode stänger fönstret, och O_NOFOLLOW hindrar
+    en planterad symlink på platsen från att styra skrivningen. Ersätter
+    open()+chmod för urklippsloten, tokenfilen och URL-filen (HANCORE, ärende 10821).
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data.encode() if isinstance(data, str) else data)
+    os.chmod(path, 0o600)                   # rättar en fil skapad av en äldre version
+
+
 def write_clip(text):
     """Lägger texten i den delade urklippsloten. 0600 — ett urklipp kan vara ett
     lösenord."""
-    with open(CLIP_PATH, "wb") as fh:
-        fh.write(text[:CLIP_MAX])
-    os.chmod(CLIP_PATH, 0o600)
+    write_private(CLIP_PATH, text[:CLIP_MAX])
 
 
 def read_clip():
@@ -267,9 +287,7 @@ def generate_qr(url):
     if r.returncode != 0 or not os.path.exists(QR_PATH):
         log("qrencode misslyckades: " + (r.stderr or b"").decode("utf-8", "replace").strip())
         return False
-    with open(URL_FILE, "w") as fh:
-        fh.write(url)
-    os.chmod(URL_FILE, 0o600)
+    write_private(URL_FILE, url)
     return True
 
 
@@ -934,9 +952,7 @@ def cmd_server():
     global _TOKEN, IS_SERVER
     IS_SERVER = True
     _TOKEN = secrets.token_urlsafe(9)
-    with open(TOKEN_FILE, "w") as fh:
-        fh.write(_TOKEN)
-    os.chmod(TOKEN_FILE, 0o600)
+    write_private(TOKEN_FILE, _TOKEN)      # token är hela gaten: 0600 från start
     url = server_url(_TOKEN)
     with open(PID_FILE, "w") as fh:
         fh.write(str(os.getpid()))
@@ -1158,6 +1174,9 @@ def cmd_selftest():
             fh.write("#!/bin/sh\n" + body)
         os.chmod(os.path.join(shim, name), 0o755)
 
+    os.makedirs(os.path.join(tmp, "sling"), exist_ok=True)
+    os.chmod(os.path.join(tmp, "sling"), 0o755)     # som en katalog skapad av en äldre version
+
     env = dict(os.environ,
                PATH=shim + ":" + os.environ.get("PATH", ""),
                SLING_PORT=str(port),
@@ -1207,8 +1226,18 @@ def cmd_selftest():
             except Exception:
                 time.sleep(0.1)
 
-        with open(os.path.join(tmp, "sling", "token")) as fh:
+        token_path = os.path.join(tmp, "sling", "token")
+        with open(token_path) as fh:
             token = fh.read().strip()
+
+        # HANCORE (2026-10-10): en fil skapad med open() är läsbar för andra lokala konton
+        # innan chmod hinner sätta 0600. Allt hemlighetsbärande skrivs därför med mode vid
+        # skapandet, och katalogerna tvingas till 0700 varje start.
+        check("tokenfilen skrivs med 0600 (inget fönster)", stat.S_IMODE(os.stat(token_path).st_mode) == 0o600,
+              oct(stat.S_IMODE(os.stat(token_path).st_mode))[-3:])
+        _ddir = os.path.join(tmp, "sling")
+        check("tillståndskatalogen tvingas till 0700", stat.S_IMODE(os.stat(_ddir).st_mode) == 0o700,
+              oct(stat.S_IMODE(os.stat(_ddir).st_mode))[-3:])
 
         payloads = [
             ("tom.bin", b""),
@@ -1377,6 +1406,8 @@ def cmd_selftest():
                 subprocess.run = real_clip_run
         finally:
             globals()["CLIP_PATH"] = saved_clip_path
+        check("urklippsloten skrivs med 0600", stat.S_IMODE(os.stat(clip_slot).st_mode) == 0o600,
+              oct(stat.S_IMODE(os.stat(clip_slot).st_mode))[-3:])
         with open(clip_slot) as fh:
             shared = fh.read()
         check("urklippet från PC:n hamnar i sloten", rc_clip == 0 and shared == "delat urklipp ✓",

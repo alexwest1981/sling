@@ -587,6 +587,9 @@ BarWidget {
               text: root.transfer
                     ? (root.transfer.dir === "up" ? "📥 " : "📤 ") + root.transfer.name
                     : root.str.idle
+              // Filnamn är data, inte uppmärkning: AutoText skulle tolka "<img …>" i
+              // ett uppladdat namn som rik text och låta skalet hämta bilden (HANCORE).
+              textFormat: Text.PlainText
               color: root.transfer ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.5)
               font.family: root.bar.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -711,6 +714,7 @@ BarWidget {
 
               Text {
                 text: modelData.name
+                textFormat: Text.PlainText          // namn är data, aldrig uppmärkning
                 color: root.bar.foreground
                 font.family: root.bar.fontFamily
                 font.pixelSize: Style.font.bodySmall
@@ -802,6 +806,7 @@ BarWidget {
 
               Text {
                 text: modelData.name
+                textFormat: Text.PlainText          // namn från telefonen, aldrig uppmärkning
                 color: root.bar.foreground
                 font.family: root.bar.fontFamily
                 font.pixelSize: Style.font.bodySmall

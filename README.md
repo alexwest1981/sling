@@ -36,7 +36,7 @@ Current version: `1.3.0`.
 
 Only `qrencode` is required; the rest degrade gracefully — the panel reports what is missing (`omarchy-sling status` → `"qr_ok": false`) instead of showing a blank square. The daemon itself is Python 3 standard library only.
 
-Verify a build at any time — `selftest` starts its own server on a spare port in a scratch directory and runs **47 checks**: files of four sizes uploaded and compared byte for byte, the token gate (403), the size cap (413), duplicate names, queue deduplication and removal (the source file always survives), the connection cap and read deadline (threads and file descriptors stay bounded when a silent peer opens more connections than the cap), the clipboard in both directions (the shared text never reaches argv or a notification), and that a running transfer is visible through both the server's `/status` and the CLI the panel polls:
+Verify a build at any time — `selftest` starts its own server on a spare port in a scratch directory and runs **50 checks**: files of four sizes uploaded and compared byte for byte, the token gate (403), the size cap (413), duplicate names, queue deduplication and removal (the source file always survives), the connection cap and read deadline (threads and file descriptors stay bounded when a silent peer opens more connections than the cap), the clipboard in both directions (the shared text never reaches argv or a notification, and the slot, the token file and the state directory are created with 0600/0700 from the start, never chmodded afterwards), and that a running transfer is visible through both the server's `/status` and the CLI the panel polls:
 
 ```bash
 omarchy-sling selftest
@@ -110,7 +110,7 @@ omarchy-sling clip                   # share the PC clipboard with the phone (pa
 omarchy-sling copy [mdns]            # put the token URL in the clipboard (wm-agnostic stdin, never argv)
 omarchy-sling open [send|received]   # open the Received (default) or Send folder
 omarchy-sling stop                   # stop now (SIGTERM, then SIGKILL)
-omarchy-sling selftest               # the 47 checks above
+omarchy-sling selftest               # the 50 checks above
 ```
 
 `status` reports the running transfer under `active` (direction, file name, bytes, total, percentage and speed), read from the server itself — the same values the panel draws.
