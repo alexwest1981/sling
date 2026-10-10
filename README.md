@@ -3,7 +3,7 @@
 
 Sling files between your smartphone (iPhone or Android) and your Linux PC with **zero apps to install on your mobile device**. Scan the QR code in the bar and the transfer portal opens in your phone's browser.
 
-![Sling Preview](./preview.png)
+![Sling Preview](./preview.jpg)
 
 Current version: `1.3.0`.
 
@@ -92,6 +92,10 @@ omarchy-restart-shell
 ## 🕹️ Usage
 
 **From the panel:** click the bar icon — the server starts and the QR code appears inside the neon reticle. **Drag a file onto the bar icon** and it is queued for the phone immediately (no picker window). Below it: the `sling.local` address, the transfer dock (which reads *Ready — waiting for a file* when nothing is moving), the send queue and the last received files. The queue lists the first five files waiting for the phone with a `✕` per file, plus **📁 Open Send folder** and **🗑 Clear all** — a `+ N more…` line opens the folder. Buttons: **📁 Open folder**, **📤 Send file…**, **📋 Send clipboard to phone** (the phone reads it in its *Clipboard* card, and can paste text back the other way), **▶ Start / 🛑 Stop**.
+
+The panel and the phone page, both drawn from the code itself — `tools/preview/` renders them:
+
+![Sling panel and phone page](./tools/preview/preview-941.png)
 
 **From the terminal:**
 

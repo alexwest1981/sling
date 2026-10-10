@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sling</title>
+    <style>
+        :root { --bg:#0d1117; --card:#161c26; --accent:#00f0ff; --accent-glow:rgba(0,240,255,.22);
+                 --magenta:#ff007f; --violet:#a855f7; --success:#00f0ff; --fg:#e6edf3; --fg-dim:#94a3b8;
+                 --border:rgba(0,240,255,.16);
+                 --mono:ui-monospace,"JetBrains Mono","SF Mono",Menlo,Consolas,monospace; }
+        * { box-sizing:border-box; margin:0; padding:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+        body { background:var(--bg); color:var(--fg); min-height:100vh; padding:24px 16px;
+                display:flex; flex-direction:column; align-items:center;
+                background-image:radial-gradient(120% 60% at 50% -10%, rgba(168,85,247,.18), transparent 60%),
+                                 radial-gradient(90% 50% at 90% 0%, rgba(255,0,127,.13), transparent 60%); }
+        .container { width:100%; max-width:460px; }
+        header { text-align:center; margin-bottom:24px; }
+        h1 { font-size:32px; font-weight:800; letter-spacing:.22em; text-indent:.22em; text-transform:uppercase;
+              color:#fff; text-shadow:0 0 5px var(--magenta), 0 0 16px var(--magenta), 0 0 34px var(--violet); }
+        p.subtitle { color:var(--fg-dim); font-size:14px; margin-top:8px; }
+        .card { background:var(--card); border:1px solid var(--border); border-radius:18px; padding:22px;
+                 box-shadow:0 10px 30px rgba(0,0,0,.45), inset 0 0 40px rgba(0,240,255,.03); margin-bottom:20px; }
+        .dropzone { border:2px dashed var(--accent); border-radius:14px; padding:36px 16px; text-align:center;
+                     background:rgba(0,240,255,.05); cursor:pointer; transition:all .2s cubic-bezier(.4,0,.2,1); }
+        .dropzone:active { background:var(--accent-glow); transform:scale(.98); box-shadow:0 0 24px var(--accent-glow); }
+        .dropzone-icon { font-size:52px; margin-bottom:12px; filter:drop-shadow(0 0 10px rgba(0,240,255,.55)); }
+        .dropzone-text { font-size:17px; font-weight:700; color:#fff; }
+        .dropzone-sub { font-size:13px; color:var(--fg-dim); margin-top:6px; }
+        #fileInput { display:none; }
+        #progressContainer { display:none; margin-top:20px; }
+        .progress-bar-bg { background:rgba(255,255,255,.07); height:12px; border-radius:6px; overflow:hidden;
+                            border:1px solid var(--border); }
+        .progress-bar-fill { background:linear-gradient(90deg,var(--violet),var(--accent)); height:100%; width:0%;
+                              transition:width .1s linear; box-shadow:0 0 14px rgba(0,240,255,.8); }
+        .progress-status { font-family:var(--mono); font-size:13px; color:var(--accent); margin-top:10px;
+                            text-align:center; font-weight:600; }
+        .file-item { display:flex; align-items:center; justify-content:space-between; background:rgba(0,0,0,.3);
+                      padding:12px 14px; border-radius:10px; margin-bottom:8px; font-size:14px;
+                      border:1px solid var(--border); }
+        .file-info { display:flex; flex-direction:column; overflow:hidden; max-width:240px; }
+        .file-name { color:#fff; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .file-size { color:var(--fg-dim); font-size:12px; margin-top:2px; font-family:var(--mono); }
+        .dl-btn { background:var(--accent); color:#0d1117; padding:8px 14px; border-radius:8px; font-size:13px;
+                   font-weight:700; text-decoration:none; flex-shrink:0; box-shadow:0 0 16px rgba(0,240,255,.35); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Sling</h1>
+            <p class="subtitle" id="t-subtitle">Fast wireless file sharing with your PC</p>
+        </header>
+
+        <div class="card">
+            <h2 id="t-send-title" style="font-size:17px;margin-bottom:14px;color:#fff;display:flex;align-items:center;gap:6px;">📱 Send to PC</h2>
+            <form id="uploadForm" enctype="multipart/form-data">
+                <input type="file" id="fileInput" name="files" multiple>
+                <div class="dropzone" onclick="document.getElementById('fileInput').click()">
+                    <div class="dropzone-icon">📤</div>
+                    <div class="dropzone-text" id="t-drop-title">Select photos or files</div>
+                    <div class="dropzone-sub" id="t-drop-sub">Tap here to upload</div>
+                </div>
+            </form>
+
+            <div id="progressContainer">
+                <div class="progress-bar-bg"><div class="progress-bar-fill" id="progressBar"></div></div>
+                <div class="progress-status" id="progressStatus">Starting...</div>
+            </div>
+        </div>
+
+        <div class="card" id="downloadCard" style="display: block;">
+            <h2 id="t-get-title" style="font-size:17px;margin-bottom:14px;color:#fff;display:flex;align-items:center;gap:6px;">💻 Get from PC</h2>
+            <div><div class="file-item"><div class="file-info"><span class="file-name">📄 semesterbilder.zip</span><span class="file-size">12.0 MB</span></div><a href="download/semesterbilder.zip" class="dl-btn t-dl-btn" download>Download</a></div><div class="file-item"><div class="file-info"><span class="file-name">📄 kvitto.pdf</span><span class="file-size">179.7 KB</span></div><a href="download/kvitto.pdf" class="dl-btn t-dl-btn" download>Download</a></div></div>
+        </div>
+
+        <div class="card">
+            <h2 id="t-clip-title" style="font-size:17px;margin-bottom:14px;color:#fff;display:flex;align-items:center;gap:6px;">📋 Clipboard</h2>
+            <textarea id="clipText" rows="3" spellcheck="false"
+                      style="width:100%;box-sizing:border-box;background:rgba(0,0,0,.3);border:1px solid var(--border);border-radius:10px;color:#fff;padding:10px;font-family:var(--mono);font-size:13px;resize:vertical;"></textarea>
+            <div style="display:flex;gap:8px;margin-top:10px;">
+                <button type="button" id="clipSend" class="dl-btn" style="flex:1;border:0;cursor:pointer;padding:10px;"></button>
+                <button type="button" id="clipGet" class="dl-btn" style="flex:1;border:0;cursor:pointer;padding:10px;"></button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const I18N = {
+            en: { subtitle:"Fast wireless file sharing with your PC", send_title:"📱 Send to PC", drop_title:"Select photos or files",
+                   drop_sub:"Tap here to upload", starting:"Starting transfer...", uploading:"Uploading...",
+                   done:"✅ Done! Files saved on PC.", error:"❌ Upload failed.", too_big:"❌ Too large — split the file or raise the limit.",
+                   conn_error:"❌ Connection error.", get_title:"💻 Get from PC", download:"Download", clip_title:"Clipboard" },
+            sv: { subtitle:"Snabb trådlös fildelning direkt till din dator", send_title:"📱 Skicka till datorn",
+                   drop_title:"Välj foton eller filer", drop_sub:"Tryck här för att ladda upp", starting:"Startar överföring...",
+                   uploading:"Laddar upp...", done:"✅ Klart! Filerna är sparade på datorn.", error:"❌ Fel vid uppladdning.",
+                   too_big:"❌ För stor fil — dela den eller höj gränsen.", conn_error:"❌ Anslutningsfel.",
+                   get_title:"💻 Hämta från datorn", download:"Ladda ner", clip_title:"Urklipp" },
+            nl: { subtitle:"Snelle draadloze bestandsoverdracht naar je pc", send_title:"📱 Naar pc sturen",
+                   drop_title:"Selecteer foto's of bestanden", drop_sub:"Tik hier om te uploaden", starting:"Overdracht starten...",
+                   uploading:"Uploaden...", done:"✅ Klaar! Bestanden opgeslagen op pc.", error:"❌ Uploaden mislukt.",
+                   too_big:"❌ Te groot — splits het bestand of verhoog de limiet.", conn_error:"❌ Verbindingsfout.",
+                   get_title:"💻 Ophalen van pc", download:"Downloaden", clip_title:"Klembord" },
+            ja: { subtitle:"PCとスマホ間で素早くファイル転送", send_title:"📱 PCへ送信", drop_title:"写真またはファイルを選択",
+                   drop_sub:"タップしてアップロード", starting:"転送を開始しています...", uploading:"アップロード中...",
+                   done:"✅ 完了！PCに保存されました。", error:"❌ アップロードに失敗しました。",
+                   too_big:"❌ ファイルが大きすぎます。分割するか上限を上げてください。", conn_error:"❌ 接続エラー。",
+                   get_title:"💻 PCから受信", download:"ダウンロード", clip_title:"クリップボード" },
+            de: { subtitle:"Schnelle drahtlose Dateiübertragung zu deinem PC", send_title:"📱 An PC senden",
+                   drop_title:"Fotos oder Dateien auswählen", drop_sub:"Tippen zum Hochladen", starting:"Übertragung startet...",
+                   uploading:"Wird hochgeladen...", done:"✅ Fertig! Dateien auf dem PC gespeichert.", error:"❌ Fehler beim Hochladen.",
+                   too_big:"❌ Zu groß — Datei teilen oder Limit erhöhen.", conn_error:"❌ Verbindungsfehler.",
+                   get_title:"💻 Vom PC herunterladen", download:"Herunterladen", clip_title:"Zwischenablage" },
+            fr: { subtitle:"Partage de fichiers rapide et sans fil avec votre PC", send_title:"📱 Envoyer au PC",
+                   drop_title:"Sélectionner des photos ou fichiers", drop_sub:"Appuyez ici pour téléverser",
+                   starting:"Démarrage du transfert...", uploading:"Téléversement...", done:"✅ Terminé ! Fichiers enregistrés sur le PC.",
+                   error:"❌ Échec du téléversement.", too_big:"❌ Trop volumineux — divisez le fichier ou augmentez la limite.",
+                   conn_error:"❌ Erreur de connexion.", get_title:"💻 Télécharger depuis le PC", download:"Télécharger", clip_title:"Presse-papiers" },
+            es: { subtitle:"Transferencia rápida de archivos con tu PC", send_title:"📱 Enviar a la PC",
+                   drop_title:"Seleccionar fotos o archivos", drop_sub:"Toca aquí para subir", starting:"Iniciando transferencia...",
+                   uploading:"Subiendo...", done:"✅ ¡Listo! Archivos guardados en la PC.", error:"❌ Error al subir.",
+                   too_big:"❌ Demasiado grande — divide el archivo o sube el límite.", conn_error:"❌ Error de conexión.",
+                   get_title:"💻 Descargar desde la PC", download:"Descargar", clip_title:"Portapapeles" },
+            zh: { subtitle:"在手机和电脑之间快速无线传输文件", send_title:"📱 发送到电脑", drop_title:"选择照片或文件",
+                   drop_sub:"点击此处上传", starting:"正在开始传输...", uploading:"正在上传...", done:"✅ 完成！文件已保存到电脑。",
+                   error:"❌ 上传失败。", too_big:"❌ 文件太大——请拆分文件或提高上限。", conn_error:"❌ 连接错误。",
+                   get_title:"💻 从电脑下载", download:"下载", clip_title:"剪贴板" }
+        };
+
+        const userLang = (navigator.language || 'en').slice(0, 2).toLowerCase();
+        const t = I18N[userLang] || I18N.en;
+
+        document.getElementById('t-subtitle').innerText = t.subtitle;
+        document.getElementById('t-send-title').innerText = t.send_title;
+        document.getElementById('t-drop-title').innerText = t.drop_title;
+        document.getElementById('t-drop-sub').innerText = t.drop_sub;
+        const getTitle = document.getElementById('t-get-title');
+        if (getTitle) getTitle.innerText = t.get_title;
+        document.querySelectorAll('.t-dl-btn').forEach(el => el.innerText = t.download);
+
+        const fileInput = document.getElementById('fileInput');
+        const progressContainer = document.getElementById('progressContainer');
+        const progressBar = document.getElementById('progressBar');
+        const progressStatus = document.getElementById('progressStatus');
+
+        fileInput.addEventListener('change', () => {
+            if (fileInput.files.length === 0) return;
+            uploadFiles(fileInput.files);
+        });
+
+        function uploadFiles(files) {
+            const formData = new FormData();
+            for (let i = 0; i < files.length; i++) formData.append('files', files[i]);
+
+            progressContainer.style.display = 'block';
+            progressBar.style.width = '0%';
+            progressBar.style.background = '';   // låt CSS-gradienten styra
+            progressStatus.innerText = t.starting;
+
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', 'upload', true);       // relativ: behåller token-prefixet
+
+            xhr.upload.onprogress = (e) => {
+                if (e.lengthComputable) {
+                    const percent = Math.round((e.loaded / e.total) * 100);
+                    progressBar.style.width = percent + '%';
+                    const mb = (e.loaded / (1024*1024)).toFixed(1);
+                    const totalMb = (e.total / (1024*1024)).toFixed(1);
+                    progressStatus.innerText = `${t.uploading} ${percent}% (${mb} / ${totalMb} MB)`;
+                }
+            };
+
+            xhr.onload = () => {
+                if (xhr.status === 200) {
+                    progressBar.style.background = 'var(--success)';
+                    progressStatus.innerText = t.done;
+                    setTimeout(() => {
+                        progressContainer.style.display = 'none';
+                        progressBar.style.background = 'var(--accent)';
+                    }, 4000);
+                } else if (xhr.status === 413) {
+                    progressStatus.innerText = t.too_big;
+                } else {
+                    progressStatus.innerText = t.error;
+                }
+            };
+
+            xhr.onerror = () => { progressStatus.innerText = t.conn_error; };
+            xhr.send(formData);
+        }
+
+        // Urklipp: texten går som kropp (aldrig i URL:en), och PC:ns urklipp
+        // hämtas bara när man trycker — det PC-användaren delat, inget mer.
+        const clipText = document.getElementById('clipText');
+        const clipSend = document.getElementById('clipSend');
+        const clipGet = document.getElementById('clipGet');
+        document.getElementById('t-clip-title').innerText = t.clip_title;
+        clipSend.innerText = t.send_title;
+        clipGet.innerText = t.get_title;
+
+        clipSend.addEventListener('click', () => {
+            if (!clipText.value.trim()) return;
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', 'clip', true);
+            xhr.setRequestHeader('Content-Type', 'text/plain; charset=utf-8');
+            xhr.onload = () => { clipSend.innerText = xhr.status === 200 ? '✅' : t.error; };
+            xhr.onerror = () => { clipSend.innerText = t.conn_error; };
+            xhr.send(clipText.value);
+        });
+
+        clipGet.addEventListener('click', () => {
+            fetch('clip', { cache: 'no-store' })
+                .then(r => r.text())
+                .then(txt => {
+                    clipText.value = txt;
+                    clipText.focus();
+                    clipText.select();       // vanlig HTTP är ingen säker kontext: markera i stället för Clipboard-API
+                    try { document.execCommand('copy'); } catch (e) {}
+                })
+                .catch(() => { clipGet.innerText = t.conn_error; });
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>m</title></head>
+<body>
+<script>
+  // Mäter en sidas visuella innehållshöjd vid given bredd: measure.html?src=X&w=N
+  // (behövs för att klippa panelen/telefonen exakt där innehållet tar slut).
+  const q = new URLSearchParams(location.search);
+  const f = document.createElement('iframe');
+  f.src = q.get('src'); f.style.width = (q.get('w') || 355) + 'px';
+  f.style.height = '4000px'; f.style.border = '0';
+  document.body.appendChild(f);
+  f.addEventListener('load', () => {
+    const d = f.contentDocument, cs = f.contentWindow.getComputedStyle(d.body);
+    const all = [...d.body.querySelectorAll('*')].filter(e => !['SCRIPT', 'STYLE'].includes(e.tagName));
+    const bottom = Math.max(...all.map(e => e.getBoundingClientRect().bottom));
+    document.body.innerHTML = '<pre>' + f.src.split('/').pop() + ' CONTENT=' +
+      Math.ceil(bottom + parseFloat(cs.paddingBottom || 0)) + '</pre>';
+  });
+</script>
+</body></html>

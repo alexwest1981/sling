@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<!-- Panelen som den faktiskt ser ut: yta, mått och strängar tagna från BarWidget.qml
+     (#0d1117, cyan #00f0ff, magenta #ff007f, Style.font 10/11/14/16/24,
+     Style.space: kort 340, QR-ruta 246, QR 176/146, kontrollknappar 20). -->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  :root {
+    --obsidian: #0d1117;
+    --cyan: #00f0ff;
+    --magenta: #ff007f;
+    --fg: #e6edf3;
+    --fg-dim: #8b949e;
+    --fg-dimmer: #6b7280;
+    --danger: #f7768e;
+    --mono: "JetBrainsMono Nerd Font", "JetBrainsMono NF", ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: transparent; font-family: var(--mono); }
+  body { padding: 10px; }
+
+  .panel {
+    width: 340px;
+    background: var(--obsidian);
+    border: 1px solid var(--cyan);
+    border-radius: 14px;
+    padding: 10px;
+    color: var(--fg);
+    display: flex; flex-direction: column; gap: 12px;
+    box-shadow: 0 0 24px rgba(0,240,255,.28), inset 0 0 24px rgba(0,240,255,.06);
+  }
+
+  .head { display: flex; align-items: center; gap: 10px; }
+  .head .mark {
+    width: 46px; height: 46px; flex: 0 0 46px;
+    border: 1px solid var(--cyan); border-radius: 6px;
+    background: rgba(0,240,255,.10);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 24px; color: var(--magenta);
+    text-shadow: 0 0 12px rgba(255,0,127,.9);
+  }
+  .head .mark span { font-family: var(--mono); }
+  .wordmark {
+    font-size: 16px; font-weight: 700; letter-spacing: 3px; color: #fff;
+    text-shadow: 0 0 10px rgba(255,0,127,.95), 0 0 22px rgba(255,0,127,.55);
+  }
+  .subtitle { font-size: 11px; color: var(--fg-dim); margin-top: 2px; }
+
+  .rule { height: 1px; background: var(--cyan); opacity: .35; }
+
+  .qr-card {
+    height: 246px; border: 1px solid var(--cyan); border-radius: 6px;
+    background: #080c11;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+  }
+  .reticle { position: relative; width: 176px; height: 176px; }
+  .qr-canvas {
+    position: absolute; inset: 8px; background: #fff; border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .qr-canvas img { width: 146px; height: 146px; image-rendering: pixelated; }
+  .corner { position: absolute; width: 18px; height: 18px; }
+  .corner.tl { left: 0;  top: 0; }
+  .corner.tr { right: 0; top: 0; }
+  .corner.bl { left: 0;  bottom: 0; }
+  .corner.br { right: 0; bottom: 0; }
+  .corner i { position: absolute; background: var(--cyan); border-radius: 1px; display: block; }
+  .corner i.h { height: 2px; width: 100%; }
+  .corner i.v { width: 2px; height: 100%; }
+  .corner.tl i.h, .corner.tl i.v { left: 0; top: 0; }
+  .corner.tr i.h { right: 0; top: 0; } .corner.tr i.v { right: 0; top: 0; }
+  .corner.bl i.h { left: 0; bottom: 0; } .corner.bl i.v { left: 0; bottom: 0; }
+  .corner.br i.h { right: 0; bottom: 0; } .corner.br i.v { right: 0; bottom: 0; }
+
+  .pill {
+    height: 24px; border-radius: 12px; background: rgba(255,255,255,.06);
+    display: flex; align-items: center; justify-content: center; padding: 0 8px;
+    font-size: 10px; font-weight: 700; color: var(--fg); max-width: 320px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .pill.sub { height: 22px; border-radius: 11px; background: rgba(255,255,255,.04);
+              font-weight: 400; color: var(--fg-dim); }
+
+  .dock { border: 1px solid rgba(0,240,255,.35); border-radius: 6px; background: #080c11;
+          padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+  .dock .row { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; }
+  .dock .name { font-size: 11px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dock .pct { font-size: 14px; font-weight: 700; color: var(--cyan); }
+  .bar { height: 8px; border-radius: 4px; background: rgba(255,255,255,.08); overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: var(--cyan); border-radius: 4px;
+             box-shadow: 0 0 10px rgba(0,240,255,.8); }
+  .meta { font-size: 10px; color: var(--fg-dimmer); }
+
+  .section-title { font-size: 10px; font-weight: 700; color: var(--fg-dim);
+                   display: flex; align-items: center; justify-content: space-between; }
+  .icon-btn { width: 20px; height: 20px; border-radius: 5px; display: inline-flex;
+              align-items: center; justify-content: center; font-size: 10px; color: var(--fg-dim); }
+  .icon-btn.danger { color: var(--danger); }
+  .titles { display: flex; align-items: center; gap: 4px; }
+
+  .row-card {
+    height: 34px; border: 1px solid rgba(230,237,243,.18); border-radius: 6px;
+    background: rgba(255,255,255,.04);
+    display: flex; align-items: center; gap: 6px; padding: 0 6px 0 10px;
+  }
+  .row-card .emoji { font-size: 11px; }
+  .row-card .fname { font-size: 11px; font-weight: 700; flex: 1; overflow: hidden;
+                     text-overflow: ellipsis; white-space: nowrap; }
+  .row-card .fsize { font-size: 10px; color: var(--fg-dimmer); }
+
+  .btn-row { display: flex; gap: 8px; }
+  .btn {
+    flex: 1; border: 1px solid rgba(230,237,243,.25); border-radius: 6px;
+    background: rgba(255,255,255,.03); color: var(--fg);
+    font-family: var(--mono); font-size: 11px; padding: 7px 8px; text-align: center;
+    white-space: nowrap;
+  }
+  .btn.wide { flex: none; width: 100%; }
+  .btn.stop { color: var(--danger); border-color: rgba(247,118,142,.45); }
+</style>
+</head>
+<body>
+  <div class="panel">
+    <div class="head">
+      <div class="mark"><span>&#xF0441;</span></div>
+      <div>
+        <div class="wordmark">SLING</div>
+        <div class="subtitle">Fast wireless file sharing with your PC</div>
+      </div>
+    </div>
+
+    <div class="rule"></div>
+
+    <div class="qr-card">
+      <div class="reticle">
+        <div class="qr-canvas"><img src="qr-demo.png" alt="QR"></div>
+        <div class="corner tl"><i class="h"></i><i class="v"></i></div>
+        <div class="corner tr"><i class="h"></i><i class="v"></i></div>
+        <div class="corner bl"><i class="h"></i><i class="v"></i></div>
+        <div class="corner br"><i class="h"></i><i class="v"></i></div>
+      </div>
+      <!-- Död demolänk: neutral adress, ingen av Alex riktiga nät eller token. -->
+      <div class="pill">&#x1F517; http://192.168.1.42:5380/t/demo-token/</div>
+      <div class="pill sub">&#x1F3E0; http://sling.local:5380/t/demo-token/</div>
+    </div>
+
+    <div class="dock">
+      <div class="row">
+        <div class="name">&#x1F4E5; IMG_20261010_142233.jpg</div>
+        <div class="pct">42 %</div>
+      </div>
+      <div class="bar"><i style="width:42%"></i></div>
+      <div class="meta">75.6 KB / 179.9 KB &nbsp;·&nbsp; 8.2 MB/s</div>
+    </div>
+
+    <div class="section-title">
+      <span>&#x1F4E4; Files waiting to be sent (2):</span>
+      <span class="titles"><span class="icon-btn">&#x1F4C1;</span><span class="icon-btn danger">&#x1F5D1;</span></span>
+    </div>
+    <div class="row-card">
+      <span class="emoji">&#x1F4E4;</span>
+      <span class="fname">kvitto.pdf</span><span class="fsize">179.7 KB</span>
+      <span class="icon-btn danger">&#x2715;</span>
+    </div>
+    <div class="row-card">
+      <span class="emoji">&#x1F4E4;</span>
+      <span class="fname">semesterbilder.zip</span><span class="fsize">12.0 MB</span>
+      <span class="icon-btn danger">&#x2715;</span>
+    </div>
+
+    <div class="section-title"><span>&#x1F4E5; Recently received files:</span></div>
+    <div class="row-card">
+      <span class="emoji">&#x1F4C4;</span>
+      <span class="fname">Screenshot_20261010.png</span><span class="fsize">179.9 KB</span>
+    </div>
+    <div class="row-card">
+      <span class="emoji">&#x1F4C4;</span>
+      <span class="fname">anteckningar.txt</span><span class="fsize">2.5 KB</span>
+    </div>
+
+    <div class="btn-row">
+      <div class="btn">&#x1F4C1; Open folder</div>
+      <div class="btn">&#x1F4E4; Send file&#x2026;</div>
+    </div>
+    <div class="btn-row"><div class="btn wide">&#x1F4CB; Send clipboard to phone</div></div>
+    <div class="btn-row"><div class="btn wide stop">&#x1F6D1; Stop</div></div>
+  </div>
+</body>
+</html>

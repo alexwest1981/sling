@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<!-- Ritytan som blir preview.png. Båda skärmarna är riktiga UI:
+       * panelen   = BarWidget.qml återgiven i panel.html, i verklig storlek (Style.space(340) bred)
+       * telefonen = den körande serverns egen mobilsida, hämtad till phone-real.html
+     Inget påhittat: ingen app i telefonen, ingen påhittad sidopanel, ingen fiktiv
+     överföring. Demolänken i QR-koden och i URL-pillerna
+     (http://192.168.1.42:5380/t/demo-token/) är död och pekar inte på något av
+     Alex nät eller på någon levande token.
+
+     Rita om efter ändringar i panelen eller mobilsidan:
+       cd ~/Projects/sling/tools/preview
+       # 1. hämta mobilsidan på nytt från en server mot en scratch-katalog:
+       SLING_PORT=5455 SLING_BASE_DIR=.../pvsrc/Sling XDG_RUNTIME_DIR=.../pvsrc/run \
+         python3 ../../bin/omarchy-sling server
+       curl -s "http://127.0.0.1:5455/t/$(cat .../pvsrc/run/sling/token)/" -o phone-real.html
+       # 2. rendera:
+       chromium --headless=new --window-size=941,1030 --screenshot=preview-new.png \
+         --allow-file-access-from-files --hide-scrollbars \
+         --force-device-scale-factor=2 --virtual-time-budget=3000 "file://$PWD/scene.html"
+     (faktor 2 ger 1882x2060 som katalogen skalar ned; faktor 1 ger exakt 941x1030.)
+     Mobilsidans innehållshöjd mäts med measure.html om telefonen behöver klippas om. -->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  :root {
+    --obsidian: #0d1117;
+    --deep: #060a0f;
+    --cyan: #00f0ff;
+    --magenta: #ff007f;
+    --fg: #e6edf3;
+    --fg-dim: #8b949e;
+    --mono: "JetBrainsMono Nerd Font", "JetBrainsMono NF", ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { width: 941px; height: 1030px; margin: 0; overflow: hidden;
+               background: var(--obsidian); font-family: var(--mono); color: var(--fg); }
+
+  .glow-cyan { position: absolute; left: -90px; top: 90px; width: 720px; height: 950px;
+    background: radial-gradient(closest-side, rgba(0,240,255,.15), rgba(0,240,255,0) 70%); }
+  .glow-magenta { position: absolute; right: -140px; top: 160px; width: 720px; height: 950px;
+    background: radial-gradient(closest-side, rgba(255,0,127,.13), rgba(255,0,127,0) 70%); }
+  .grid { position: absolute; inset: 0; opacity: .5;
+    background-image: radial-gradient(rgba(0,240,255,.10) 1px, transparent 1px);
+    background-size: 26px 26px; }
+
+  header { position: absolute; left: 40px; top: 30px; }
+  .wordmark {
+    font-size: 34px; font-weight: 700; letter-spacing: 9px; color: #fff;
+    text-shadow: 0 0 14px rgba(255,0,127,.95), 0 0 34px rgba(255,0,127,.5);
+  }
+  .tagline { margin-top: 8px; font-size: 13px; color: var(--fg); }
+  .tagline b { color: var(--cyan); font-weight: 700; }
+  .chips { margin-top: 6px; font-size: 11px; color: var(--fg-dim); }
+
+  /* Panelen: verklig storlek, ingen skalning — det är pluginens eget UI. */
+  /* Höjden = panel.html egen innehållshöjd (mätt med measure.html), annars blir det
+     en tom rand under panelen. Toppen centrerar panelen mot telefonen. */
+  #panel { position: absolute; left: 40px; top: 167px; width: 364px; height: 809px;
+           border: 0; box-shadow: 0 18px 60px rgba(0,0,0,.65); }
+
+  /* Telefonen: 355 px visningsbredd (mobil layout), skalad 0.93 för att rymmas. */
+  .phone-wrap { position: absolute; left: 530px; top: 130px;
+                transform: scale(.93); transform-origin: top left;
+                filter: drop-shadow(0 18px 60px rgba(0,0,0,.7)); }
+  .phone { width: 375px; height: 949px; background: #000; border-radius: 44px; padding: 10px;
+           border: 1px solid rgba(230,237,243,.16); }
+  .screen { width: 355px; height: 929px; background: var(--deep);
+            border-radius: 36px; overflow: hidden; }
+  .chrome { height: 46px; background: #11161d; border-bottom: 1px solid rgba(230,237,243,.10);
+            display: flex; align-items: center; gap: 8px; padding: 0 14px;
+            font-size: 11px; color: var(--fg-dim); }
+  .url { flex: 1; height: 26px; border-radius: 13px; background: rgba(255,255,255,.06);
+         display: flex; align-items: center; gap: 6px; padding: 0 10px;
+         color: var(--fg); font-size: 10.5px; white-space: nowrap; }
+  #phone { width: 355px; height: 883px; border: 0; }
+
+  .dotted { position: absolute; left: 404px; top: 330px; width: 126px; height: 200px; }
+  .dotted path { stroke: var(--cyan); stroke-width: 1.2; fill: none;
+                 stroke-dasharray: 5 7; opacity: .55; }
+</style>
+</head>
+<body>
+  <div class="glow-cyan"></div>
+  <div class="glow-magenta"></div>
+  <div class="grid"></div>
+
+  <header>
+    <div class="wordmark">SLING</div>
+    <div class="tagline">Zero-app QR file drop &mdash; <b>phone &harr; PC</b> over your own Wi-Fi</div>
+    <div class="chips">No app on the phone &middot; files and clipboard, both directions &middot; nothing leaves your Wi-Fi</div>
+  </header>
+
+  <svg class="dotted" viewBox="0 0 126 200">
+    <path d="M 4 70 C 52 70, 88 112, 112 152" />
+    <path d="M 112 152 l -12 -5 M 112 152 l 3 -12" />
+  </svg>
+
+  <iframe id="panel" src="panel.html" scrolling="no"></iframe>
+
+  <div class="phone-wrap">
+    <div class="phone">
+      <div class="screen">
+        <div class="chrome">
+          <span>&#x24D8;</span>
+          <span class="url">sling.local:5380/t/demo-token/</span>
+          <span>&#x21BB;</span>
+        </div>
+        <iframe id="phone" src="phone-real.html" scrolling="no"></iframe>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
