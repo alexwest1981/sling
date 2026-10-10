@@ -1606,6 +1606,24 @@ def cmd_selftest():
         if not cond:
             failures.append(name)
 
+    def source_shape_hits(text):
+        """Former i produktionshalvan som redan har kostat en granskningsrunda.
+
+        Provsviten bevisar beteende; de här bevisar form. En klass kom tillbaka en
+        gång (argv jämfördes mot namn i stället för mot form) och kostade en hel
+        runda — billigare att låta texten vittna än att hoppas att nästa ändring
+        minns. Bara produktionshalvan granskas: provkoden får starta processer och
+        läsa dem.
+        """
+        prod = text.split("def cmd_selftest")[0]
+        hits = []
+        for n, rad in enumerate(prod.splitlines(), 1):
+            if re.search(r"\bin\s+(argv|cmdline)\b", rad):
+                hits.append((n, "namn jämfört i argv i stället för form", rad.strip()))
+            if re.search(r"os\.open\(", rad) and not re.search(r"0o[0-7]{3}", rad):
+                hits.append((n, "os.open utan mode vid skapandet", rad.strip()))
+        return hits
+
     def multipart(files):
         b = "----slingtest"
         out = b""
@@ -1646,6 +1664,18 @@ def cmd_selftest():
         _ddir = os.path.join(tmp, "sling")
         check("tillståndskatalogen tvingas till 0700", stat.S_IMODE(os.stat(_ddir).st_mode) == 0o700,
               oct(stat.S_IMODE(os.stat(_ddir).st_mode))[-3:])
+        _kalla = open(os.path.abspath(__file__), encoding="utf-8").read()
+        _traffar = source_shape_hits(_kalla)
+        check("inget namn matchas i argv (identitet är en form, inte ett namn)",
+              not [h for h in _traffar if "argv" in h[1]], str(_traffar[:1]))
+        check("varje os.open bär mode vid skapandet",
+              not [h for h in _traffar if "mode" in h[1]], str(_traffar[:1]))
+        _gammal = ('    if "sling" in argv:\n'
+                   '        os.kill(pid, signal.SIGTERM)\n'
+                   '    fd = os.open(path, os.O_WRONLY | os.O_CREAT)\n')
+        check("grindarna biter på de gamla formerna", len(source_shape_hits(_gammal)) == 2,
+              str(source_shape_hits(_gammal)))
+
         _logg = os.path.join(_ddir, "server.log")
         _mode = stat.S_IMODE(os.stat(_logg).st_mode)
         check("loggfilen skapas med 0600 (inget fönster)", _mode == 0o600, oct(_mode)[-3:])
