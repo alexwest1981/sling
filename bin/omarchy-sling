@@ -29,6 +29,11 @@ VERSION = "1.3.0"
 PORT = int(os.environ.get("SLING_PORT", 5380))
 IDLE_TIMEOUT = int(os.environ.get("SLING_IDLE_TIMEOUT", 900))
 MAX_UPLOAD = int(os.environ.get("SLING_MAX_UPLOAD", 2 * 1024**3))
+# Tak för samtidiga anslutningar och tystnad per anslutning. Token kontrolleras
+# först när förfrågan är läst, så utan tak kan en granne på LAN:et öppna
+# anslutningar, tiga, och hålla en tråd och en fildeskriptor per anslutning.
+MAX_CONNECTIONS = int(os.environ.get("SLING_MAX_CONNECTIONS", 32))
+SOCKET_TIMEOUT = int(os.environ.get("SLING_SOCKET_TIMEOUT", 30))
 MDNS_NAME = os.environ.get("SLING_MDNS_NAME", "sling")
 
 BASE_DIR = os.path.expanduser(os.environ.get("SLING_BASE_DIR", "~/Downloads/Sling"))
@@ -565,10 +570,16 @@ class SlingHandler(BaseHTTPRequestHandler):
         flaggan står kvar som billig härdning, inte som bevisad fix.
         SNDBUF/RCVBUF lämnas åt kerneln: autotuning växer förbi 1 MB vid behov,
         en fast gräns gör det inte.
+
+        Tidsgränsen per anslutning: den som ansluter och sedan tiger ska inte
+        hålla en tråd och en fildeskriptor. Gränsen gäller varje läsning och
+        skrivning, inte hela överföringen — en långsam men levande telefon
+        klarar sig, och en död anslutning kastas av handle_one_request.
         """
         super().setup()
         try:
             self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.connection.settimeout(SOCKET_TIMEOUT)
         except OSError:
             pass
 
@@ -695,6 +706,10 @@ class SlingHandler(BaseHTTPRequestHandler):
         start_transfer("up", "", length)
         try:
             saved = stream_multipart(self.rfile, ctype, length, RECEIVED_DIR, on_progress=track)
+        except TimeoutError:
+            # Läsdeadlinen slog till mitt i kroppen: klienten är borta, kasta
+            # anslutningen (handle_one_request) i stället för att svara på den.
+            raise
         except OSError as exc:
             log("uppladdning misslyckades: %s" % exc)
             self._send(500, json.dumps({"ok": False, "error": str(exc)}).encode(), "application/json")
@@ -714,8 +729,40 @@ class SlingHandler(BaseHTTPRequestHandler):
 
 
 class SlingServer(ThreadingHTTPServer):
+    """En tråd per anslutning — men antalet samtidiga anslutningar har ett tak.
+
+    ThreadingMixIn startar en tråd per accepterad socket och token-grinden kommer
+    först när förfrågan är läst, så utan tak är både trådar och fildeskriptorer
+    obegränsade för en oautentiserad klient på LAN:et. Över taket svaras 503 och
+    anslutningen stängs i stället för att köas.
+    """
     daemon_threads = True
-    request_queue_size = 64          # en telefon öppnar flera anslutningar samtidigt
+    request_queue_size = MAX_CONNECTIONS
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            try:
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\n"
+                                b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()          # tråden startade aldrig
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
     def server_bind(self):
         """Hoppar över BaseHTTPServer.server_bind, som gör en omvänd DNS-lookup
@@ -974,6 +1021,8 @@ def cmd_selftest():
                SLING_BASE_DIR=tmp,
                SLING_IDLE_TIMEOUT="60",
                SLING_MAX_UPLOAD="2097152",            # 2 MB i provet
+               SLING_MAX_CONNECTIONS="8",             # taket prövas nedan
+               SLING_SOCKET_TIMEOUT="3",
                XDG_RUNTIME_DIR=tmp,
                SLING_MDNS_NAME="sling-test")
     proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), "server"],
@@ -1116,6 +1165,55 @@ def cmd_selftest():
             check("... utan att röra originalen", os.path.exists(doc1) and os.path.exists(doc2))
         finally:
             globals()["SEND_DIR"] = saved_send_dir
+
+        # Resurstak: en tyst, oautentiserad klient får inte kunna hålla hur många
+        # trådar och fildeskriptorer som helst. Provet öppnar fler anslutningar än
+        # taket och skickar inte en enda byte i någon av dem.
+        limit = int(env["SLING_MAX_CONNECTIONS"])
+        deadline = int(env["SLING_SOCKET_TIMEOUT"])
+        silent = []
+        try:
+            for _ in range(limit + 4):
+                silent.append(socket.create_connection(("127.0.0.1", port), timeout=5))
+            # Räknas medan de tysta anslutningarna ligger kvar: det är här ett
+            # obegränsat tak syns (före åtgärden: 202 trådar och 204 fds på 200).
+            threads = len(os.listdir("/proc/%d/task" % proc.pid))
+            check("trådarna hålls under taket", threads <= limit + 3, "%d trådar (tak %d)" % (threads, limit))
+            fds = len(os.listdir("/proc/%d/fd" % proc.pid))
+            check("fildeskriptorerna hålls under taket", fds <= limit + 8, "%d fds" % fds)
+
+            refused = 0
+            for s in silent:
+                s.settimeout(1)
+                try:
+                    first = s.recv(64)
+                except TimeoutError:
+                    continue                     # hålls öppen — tyst klient, inom taket
+                except OSError:
+                    refused += 1                 # servern stängde den
+                    continue
+                if first.startswith(b"HTTP/1.1 503") or first == b"":
+                    refused += 1
+            check("taket avvisar anslutningar över taket", refused >= 4, "%d av %d" % (refused, len(silent)))
+        finally:
+            for s in silent:
+                s.close()
+        time.sleep(1)
+
+        with urllib.request.urlopen("http://127.0.0.1:%d/t/%s/status" % (port, token), timeout=5) as r:
+            check("servern svarar igen efter överbelastningen", json.loads(r.read()).get("ok") is True)
+
+        # En klient som tiger släpps av läsdeadlinen i stället för att hålla kvar.
+        t0 = time.monotonic()
+        quiet = socket.create_connection(("127.0.0.1", port), timeout=deadline + 5)
+        try:
+            released = quiet.recv(64) == b""
+        except OSError:
+            released = True                      # återställd räknas också som släppt
+        finally:
+            quiet.close()
+        took = time.monotonic() - t0
+        check("tyst klient släpps av läsdeadlinen", released and took < deadline + 4, "%.1f s" % took)
 
         # Token får aldrig hamna i en process kommandorad (argv) — en annan lokal
         # användare kan läsa den ur processlistan. Provet fångar arg-versionen av
