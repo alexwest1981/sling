@@ -41,6 +41,12 @@ CLIP_MAX = int(os.environ.get("SLING_CLIP_MAX", 64 * 1024))
 CLIP_TIMEOUT = float(os.environ.get("SLING_CLIP_TIMEOUT", "5"))
 SOCKET_TIMEOUT = int(os.environ.get("SLING_SOCKET_TIMEOUT", 30))
 MDNS_NAME = os.environ.get("SLING_MDNS_NAME", "sling")
+# Sätts av cmd_server när avahi-publish-service faktiskt kör. Panelen visar
+# mDNS-adressen som "adressen att minnas", så den får bara visas när något
+# publicerar den: saknas avahi, eller tar namnet slut, är http://<namn>.local
+# en adress som inte svarar (mätt: adressen visades även när publiceringen
+# misslyckades direkt).
+MDNS_UP = False
 
 BASE_DIR = os.path.expanduser(os.environ.get("SLING_BASE_DIR", "~/Downloads/Sling"))
 RECEIVED_DIR = os.path.join(BASE_DIR, "Received")
@@ -1145,7 +1151,7 @@ def status_dict(running=None):
         "ip": ip,
         "port": PORT,
         "url": server_url(token, ip),
-        "mdns_url": "http://%s.local:%d/t/%s/" % (MDNS_NAME, PORT, token),
+        "mdns_url": ("http://%s.local:%d/t/%s/" % (MDNS_NAME, PORT, token)) if MDNS_UP else "",
         "idle_timeout": IDLE_TIMEOUT,
         "max_upload": MAX_UPLOAD,
         "qr_path": QR_PATH,
@@ -1202,6 +1208,8 @@ def cmd_server():
     write_private(TOKEN_FILE, _TOKEN)      # token är hela gaten: 0600 från start
     write_private(PID_FILE, str(os.getpid()))   # 0600 vid skapandet, som tokenfilen
     mdns = start_mdns()
+    global MDNS_UP
+    MDNS_UP = bool(mdns)                   # panelen visar adressen bara om den publiceras
     threading.Thread(target=server.serve_forever, daemon=True).start()
     qr_ok = generate_qr(url)
     log("lyssnar på 0.0.0.0:%d, mDNS=%s, qr_ok=%s" % (PORT, bool(mdns), qr_ok))
@@ -1229,6 +1237,7 @@ def cmd_server():
         server.server_close()
         if mdns:
             mdns.terminate()
+        MDNS_UP = False
         # Städa bara det som fortfarande är vårt: har en annan server tagit över
         # tillståndskatalogen är filerna dess, och att radera dem vore att slå ut
         # en körande server.
@@ -1492,7 +1501,11 @@ def cmd_selftest():
     notif_log = os.path.join(tmp, "notify-argv.txt")
     clip_slot = os.path.join(tmp, ".clipboard")
     for name, body in (("wl-copy", 'printf "%%s\\n" "$*" >> "%s"\ncat > "%s"\n' % (clip_argv, clip_out)),
-                       ("notify-send", 'printf "%%s\\n" "$*" >> "%s"\n' % notif_log)):
+                       ("notify-send", 'printf "%%s\\n" "$*" >> "%s"\n' % notif_log),
+                       # En avahi-publish-service som misslyckas direkt: provet ska se
+                       # vad panelen visar när ingenting publiceras, och selftesten ska
+                       # inte annonsera "sling" på Alex nät.
+                       ("avahi-publish-service", "exit 1\n")):
         with open(os.path.join(shim, name), "w") as fh:
             fh.write("#!/bin/sh\n" + body)
         os.chmod(os.path.join(shim, name), 0o755)
@@ -1671,6 +1684,10 @@ def cmd_selftest():
             st = json.loads(r.read())
         check("status har running/url/qr_ok", all(k in st for k in ("running", "url", "qr_ok")))
         check("status-url bär token", token in st["url"], st["url"])
+        # Adressen att minnas visas bara när något publicerar den. Med en
+        # avahi-publish-service som misslyckas direkt (skalet ovan) publiceras
+        # ingenting — då får panelen inte visa http://sling.local.
+        check("mDNS-adressen visas bara när den publiceras", st["mdns_url"] == "", repr(st["mdns_url"]))
         check("QR-koden skapas (qrencode via stdin)", st["qr_ok"] is True)
         check("status har active-nyckeln (None när inget pågår)", st.get("active") is None, str(st.get("active")))
 
