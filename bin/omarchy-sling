@@ -36,6 +36,9 @@ MAX_UPLOAD = int(os.environ.get("SLING_MAX_UPLOAD", 2 * 1024**3))
 # anslutningar, tiga, och hålla en tråd och en fildeskriptor per anslutning.
 MAX_CONNECTIONS = int(os.environ.get("SLING_MAX_CONNECTIONS", 32))
 CLIP_MAX = int(os.environ.get("SLING_CLIP_MAX", 64 * 1024))
+# Hur länge en klippkälla får hålla kommandot. En ägare som slutar skriva utan att
+# stänga får inte hänga "Send clipboard to phone".
+CLIP_TIMEOUT = float(os.environ.get("SLING_CLIP_TIMEOUT", "5"))
 SOCKET_TIMEOUT = int(os.environ.get("SLING_SOCKET_TIMEOUT", 30))
 MDNS_NAME = os.environ.get("SLING_MDNS_NAME", "sling")
 
@@ -265,6 +268,37 @@ def write_private(path, data):
         except OSError:
             pass
         raise
+
+
+def paste_bounded(*cmd):
+    """Läser en klippkälla med tak på både minne och tid. Ger (rc, data).
+
+    subprocess.run(capture_output=True) buffrar HELA strömmen i minnet innan
+    write_clip ens får se den, så en källa som strömmar utan slut äter upp
+    CLI-processens minne innan CLIP_MAX hinner verka. Här läses 64 KiB i taget tills
+    taket, källan dödas om den fortsätter, och en dödare stoppar en ägare som slutar
+    skriva utan att stänga fönstret (HANCORE, ärende 10821).
+    """
+    proc = subprocess.Popen(list(cmd), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    dodare = threading.Timer(CLIP_TIMEOUT, proc.kill)
+    dodare.start()
+    bitar, n = [], 0
+    try:
+        while n <= CLIP_MAX:
+            bit = proc.stdout.read(65536)
+            if not bit:
+                break
+            bitar.append(bit)
+            n += len(bit)
+        if n > CLIP_MAX:
+            proc.kill()                     # källan har mer — vi är klara ändå
+        proc.wait(timeout=CLIP_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError):
+        proc.kill()
+    finally:
+        dodare.cancel()
+    data = b"".join(bitar)[:CLIP_MAX]
+    return (0 if data else (proc.returncode or 1)), data
 
 
 def write_clip(text):
@@ -1140,15 +1174,15 @@ def cmd_clip():
     if not shutil.which("wl-paste"):
         print("wl-paste saknas (installera wl-clipboard)", file=sys.stderr)
         return 1
-    r = subprocess.run(["wl-paste", "-n"], capture_output=True)
-    if r.returncode != 0:                      # wl-clipboard < 2.0 har ingen -n
-        r = subprocess.run(["wl-paste"], capture_output=True)
-        r.stdout = r.stdout.rstrip(b"\n")      # ...och lägger på en egen radbrytning
-    if r.returncode != 0 or not r.stdout:
+    rc, data = paste_bounded("wl-paste", "-n")
+    if rc != 0:                                # wl-clipboard < 2.0 har ingen -n
+        rc, data = paste_bounded("wl-paste")
+        data = data.rstrip(b"\n")               # ...och lägger på en egen radbrytning
+    if rc != 0 or not data:
         print("kunde inte läsa urklippet", file=sys.stderr)
         return 1
-    write_clip(r.stdout)
-    print("urklipp delat med telefonen (%d tecken)" % min(len(r.stdout), CLIP_MAX))
+    write_clip(data)
+    print("urklipp delat med telefonen (%d tecken)" % len(data))
     return 0
 
 
@@ -1410,20 +1444,36 @@ def cmd_selftest():
         # vara ett lösenord.
         saved_clip_path = globals()["CLIP_PATH"]
         globals()["CLIP_PATH"] = clip_slot
-        real_clip_run = subprocess.run
+        real_paste = globals()["paste_bounded"]
 
-        class FakePaste:
-            returncode = 0
-            stdout = "delat urklipp ✓".encode()
-
+        # Skenbar klippkälla: proven ska varken röra användarens urklipp eller läsa
+        # från den riktiga wl-paste (den kan hänga på en ägare som inte svarar).
+        globals()["paste_bounded"] = lambda *cmd: (0, "delat urklipp ✓".encode())
         try:
-            subprocess.run = lambda cmd, **kw: FakePaste()
             try:
                 rc_clip = cmd_clip()
             finally:
-                subprocess.run = real_clip_run
+                globals()["paste_bounded"] = real_paste
         finally:
             globals()["CLIP_PATH"] = saved_clip_path
+
+        # Taket ska gälla LÄSNINGEN, inte bara det som skrivs: en källa som strömmar utan
+        # slut får inte fylla minnet, och en som slutar skriva utan att stänga får inte
+        # hänga kommandot (HANCORE, ärende 10821).
+        t0 = time.monotonic()
+        _, strommande = real_paste("yes")
+        tog = time.monotonic() - t0
+        check("strömmande klippkälla klipps vid taket", len(strommande) == CLIP_MAX and tog < 6,
+              "%d B på %.1f s" % (len(strommande), tog))
+        sparad_timeout = globals()["CLIP_TIMEOUT"]
+        globals()["CLIP_TIMEOUT"] = 1.5
+        try:
+            t0 = time.monotonic()
+            _, tyst = real_paste("sleep", "30")
+            tog = time.monotonic() - t0
+        finally:
+            globals()["CLIP_TIMEOUT"] = sparad_timeout
+        check("tyst klippkälla släpps av tidsgränsen", tyst == b"" and tog < 4, "%.1f s" % tog)
         check("urklippsloten skrivs med 0600", stat.S_IMODE(os.stat(clip_slot).st_mode) == 0o600,
               oct(stat.S_IMODE(os.stat(clip_slot).st_mode))[-3:])
         with open(clip_slot) as fh:
