@@ -57,6 +57,10 @@ nothing needs to be on your `PATH`. For terminal use, symlink it:
 ln -s ~/.config/omarchy/plugins/io.github.alexwest1981.sling/bin/omarchy-sling ~/.local/bin/omarchy-sling
 ```
 
+**The one manual step** — and the reason the marketplace lists Sling as *manual setup* — is the
+firewall line below: a stock Omarchy enables `ufw` with `deny incoming`, and Sling needs the port for
+the phone to reach it. One command, once.
+
 ### Allow Sling in your Firewall (Port 5380)
 
 Linux firewalls block incoming connections from the local network by default. Allow incoming traffic on port `5380/tcp`:
