@@ -293,6 +293,27 @@ def write_private(path, data):
         raise
 
 
+def kill_source(proc, klar):
+    """Dödar klippkällan OCH dess barn.
+
+    wl-paste fork+exec:ar ett eget `cat`-barn som ärver vårt stdout-rör. Att döda
+    bara wl-paste lämnar `cat` kvar med röret öppet, och `proc.stdout.read()` står
+    då kvar för evigt: kommandot hänger och barnet blir kvar som process (HANCORE,
+    ärende 10821). Därför startas källan i en egen processgrupp (start_new_session
+    i paste_bounded) och dödas som grupp. `klar` sätts när vi är färdiga med
+    processen, så en släpande dödare inte kan träffa en återanvänd pid.
+    """
+    if klar.is_set():
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)     # start_new_session: barnet är gruppledare
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
 def paste_bounded(*cmd):
     """Läser en klippkälla med tak på både minne och tid. Ger (rc, data).
 
@@ -302,8 +323,10 @@ def paste_bounded(*cmd):
     taket, källan dödas om den fortsätter, och en dödare stoppar en ägare som slutar
     skriva utan att stänga fönstret (HANCORE, ärende 10821).
     """
-    proc = subprocess.Popen(list(cmd), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    dodare = threading.Timer(CLIP_TIMEOUT, proc.kill)
+    klar = threading.Event()
+    proc = subprocess.Popen(list(cmd), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            start_new_session=True)
+    dodare = threading.Timer(CLIP_TIMEOUT, kill_source, (proc, klar))
     dodare.start()
     bitar, n = [], 0
     try:
@@ -314,11 +337,13 @@ def paste_bounded(*cmd):
             bitar.append(bit)
             n += len(bit)
         if n > CLIP_MAX:
-            proc.kill()                     # källan har mer — vi är klara ändå
+            kill_source(proc, klar)         # källan har mer — vi är klara ändå
+        klar.set()
         proc.wait(timeout=CLIP_TIMEOUT)
     except (subprocess.TimeoutExpired, OSError):
-        proc.kill()
+        kill_source(proc, klar)
     finally:
+        klar.set()
         dodare.cancel()
     data = b"".join(bitar)[:CLIP_MAX]
     return (0 if data else (proc.returncode or 1)), data
@@ -1588,6 +1613,61 @@ def cmd_selftest():
         finally:
             globals()["CLIP_TIMEOUT"] = sparad_timeout
         check("tyst klippkälla släpps av tidsgränsen", tyst == b"" and tog < 4, "%.1f s" % tog)
+
+        # ... och samma sak när källan har ett BARN som håller vårt stdout-rör: wl-paste
+        # fork+exec:ar ett eget `cat`-barn, och att döda bara föräldern lämnade röret
+        # öppet — läsningen stod kvar för evigt och barnet blev kvar som process
+        # (HANCORE, ärende 10821). Källan härmas av ett skal som startar ett barn vilket
+        # ärver stdout och sedan väntar självt; båda sina pidar skriver det till en fil,
+        # så provet kan se exakt de processerna i stället för att leta i /proc efter
+        # namn. Läsningen körs i en tråd, så att en kvarhängande läsning syns som ett
+        # underkänt prov i stället för att hänga hela selftesten.
+        pidfil = os.path.join(tmp, "klippkalla.pid")
+        kalla = os.path.join(tmp, "klippkalla")
+        with open(kalla, "w") as fh:
+            fh.write("#!/bin/sh\nsleep 4321 &\necho \"$$ $!\" > '%s'\nexec sleep 4321\n" % pidfil)
+        os.chmod(kalla, 0o755)
+
+        def lever(pid):
+            try:
+                with open("/proc/%s/stat" % pid) as fh:
+                    return fh.read().split()[2] != "Z"       # Z = skördad, alltså borta
+            except OSError:
+                return False
+
+        svar_barn = {}
+        globals()["CLIP_TIMEOUT"] = 1.5
+        try:
+            tr = threading.Thread(target=lambda: svar_barn.update(svar=real_paste(kalla)), daemon=True)
+            t0 = time.monotonic()
+            tr.start()
+            tr.join(6)
+            tog = time.monotonic() - t0
+        finally:
+            globals()["CLIP_TIMEOUT"] = sparad_timeout
+        try:
+            with open(pidfil) as fh:
+                pidar = [int(p) for p in fh.read().split()]
+        except (OSError, ValueError):
+            pidar = []
+        # Döm först, städa sedan: en process som dödats blir skördad strax efteråt, så
+        # domen väntar en stund på att den försvinner.
+        kvar = []
+        for _ in range(20):
+            kvar = [p for p in pidar if lever(p)]
+            if not kvar:
+                break
+            time.sleep(0.1)
+        check("källa vars barn håller stdout-röret släpps",
+              not tr.is_alive() and svar_barn.get("svar", (1, b""))[1] == b"" and tog < 4,
+              "%.1f s" % tog)
+        check("... och barnet blir inte kvar som process",
+              len(pidar) == 2 and not kvar, "%d pidar, kvar: %s" % (len(pidar), kvar))
+        for p in kvar:                                      # städa efter ett underkänt prov
+            try:
+                os.kill(p, signal.SIGKILL)
+            except OSError:
+                pass
         check("urklippsloten skrivs med 0600", stat.S_IMODE(os.stat(clip_slot).st_mode) == 0o600,
               oct(stat.S_IMODE(os.stat(clip_slot).st_mode))[-3:])
         with open(clip_slot) as fh:
