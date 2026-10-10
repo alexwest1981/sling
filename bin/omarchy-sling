@@ -268,7 +268,9 @@ def create_unique(directory, filename):
     while True:
         name = filename if counter == 0 else "%s_%d%s" % (base, counter, ext)
         try:
-            fd = os.open(os.path.join(directory, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+            # 0600 från skapandet, som tokenfilen och urklippet: filen ska inte bli
+            # läsbar för andra bara för att umask är 022 (mätt: en mottagen fil blev 0644).
+            fd = os.open(os.path.join(directory, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
             counter += 1
             continue
@@ -994,9 +996,12 @@ class SlingHandler(BaseHTTPRequestHandler):
             self._send(500, json.dumps({"ok": False, "error": "wl-copy failed"}).encode(), "application/json")
             return
         # Notisen säger bara att något kommit — innehållet är privat metadata och
-        # hör inte i argv (där låg filnamnen förut).
-        subprocess.run(["notify-send", NOTIF_STRINGS[get_system_lang()]["clipboard"],
-                        "--icon=edit-copy", "-a", "Sling"], check=False)
+        # hör inte i argv (där låg filnamnen förut). Takad körning: en notis som
+        # aldrig blir klar får inte hålla förfrågan (samma klass som wl-copy och
+        # qrencode — mätt: ett hängande notify-send lämnade uppladdningen utan svar
+        # i 20 s och två processer kvar).
+        bounded_run(["notify-send", NOTIF_STRINGS[get_system_lang()]["clipboard"],
+                     "--icon=edit-copy", "-a", "Sling"])
         log("urklipp från telefonen (%d tecken)" % len(text))
         self._send(200, b'{"ok": true}', "application/json")
 
@@ -1061,8 +1066,9 @@ class SlingHandler(BaseHTTPRequestHandler):
             key = "received_single" if len(saved) == 1 else "received_multi"
             summary = NOTIF_STRINGS[get_system_lang()][key].format(count=len(saved))
             # Bara antalet i notisen: filnamnen är privat metadata och låg förut i argv,
-            # läsbar för varje lokal användare som ser processlistan.
-            subprocess.run(["notify-send", summary, "--icon=folder-download", "-a", "Sling"], check=False)
+            # läsbar för varje lokal användare som ser processlistan. Körningen är
+            # takad, som allt annat på en förfrågningsväg.
+            bounded_run(["notify-send", summary, "--icon=folder-download", "-a", "Sling"])
             log("tog emot %d fil(er): %s" % (len(saved), ", ".join(saved[:3])))
 
         self._send(200, json.dumps({"ok": True, "saved": saved}).encode(), "application/json")
@@ -2043,6 +2049,11 @@ def cmd_selftest():
         check("samtidiga uppladdningar med samma namn får var sitt namn",
               len(namn_svar) == burst and len(set(namn_svar)) == burst and len(samma) == burst and hela,
               "%d svar, %d unika namn, %d filer i Received" % (len(namn_svar), len(set(namn_svar)), len(samma)))
+        # Mottagna filer skapades genom umask (0644) medan varje annan fil vi äger
+        # är 0600. Mätt: en uppladdad fil blev 0644.
+        lägen = [oct(stat.S_IMODE(os.stat(os.path.join(mottaget, f)).st_mode))[-3:] for f in samma]
+        check("mottagna filer skrivs 0600, inte genom umask",
+              len(samma) == burst and set(lägen) == {"600"}, str(lägen[:3]))
 
         # En klient som försvinner mitt i kroppen: den halva delen ska kastas, inte
         # ligga kvar i Received som om den vore hel. Mätt förut: 599 863 av
@@ -2141,6 +2152,49 @@ def cmd_selftest():
         check("  ... och lämnar ingen process kvar", len(häng_pidar) == 2 and not kvar,
               "%d pidar, kvar: %s" % (len(häng_pidar), kvar))
         for p in kvar:                            # städa efter ett underkänt prov
+            try:
+                os.kill(p, signal.SIGKILL)
+            except OSError:
+                pass
+
+        # Samma tak för notify-send. Notisen ligger på förfrågningsvägen både vid
+        # uppladdning och vid /clip och kördes förut utan tak — mätt: ett hängande
+        # notify-send lämnade uppladdningen utan svar i 20 s (klienten gav upp) och
+        # två processer kvar. Notisen är kosmetisk; den får aldrig hålla förfrågan.
+        notis_pidfil = os.path.join(tmp, "notis-hang.pid")
+        with open(os.path.join(shim, "notify-send"), "w") as fh:
+            fh.write("#!/bin/sh\nsleep 4319 &\necho \"$$ $!\" > '%s'\nexec sleep 4319\n" % notis_pidfil)
+        os.chmod(os.path.join(shim, "notify-send"), 0o755)
+        t0 = time.monotonic()
+        notis_kod = None
+        kropp, ctype = multipart([("notis.bin", b"N" * 50_000)])
+        try:
+            req = urllib.request.Request("http://127.0.0.1:%d/t/%s/upload" % (port, token), data=kropp,
+                                         headers={"Content-Type": ctype}, method="POST")
+            with urllib.request.urlopen(req, timeout=30) as r:
+                notis_kod = r.status
+        except Exception as exc:                      # noqa: BLE001 — provet rapporterar själv
+            notis_kod = repr(exc)
+        notis_hängde = time.monotonic() - t0
+        with open(os.path.join(shim, "notify-send"), "w") as fh:
+            fh.write('printf "%%s\\n" "$*" >> "%s"\n' % notif_log)
+        os.chmod(os.path.join(shim, "notify-send"), 0o755)
+        check("hängande notify-send ger svar inom taket", notis_kod == 200 and notis_hängde < 10,
+              "%s efter %.1f s" % (notis_kod, notis_hängde))
+        try:
+            with open(notis_pidfil) as fh:
+                notis_pidar = [int(p) for p in fh.read().split()]
+        except (OSError, ValueError):
+            notis_pidar = []
+        kvar_notis = []
+        for _ in range(20):
+            kvar_notis = [p for p in notis_pidar if lever(p)]
+            if not kvar_notis:
+                break
+            time.sleep(0.1)
+        check("  ... och lämnar ingen process kvar", len(notis_pidar) == 2 and not kvar_notis,
+              "%d pidar, kvar: %s" % (len(notis_pidar), kvar_notis))
+        for p in kvar_notis:
             try:
                 os.kill(p, signal.SIGKILL)
             except OSError:
