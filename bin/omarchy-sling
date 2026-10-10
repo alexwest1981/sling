@@ -486,6 +486,13 @@ def stale_publishers():
     sling.local. Mätt: en kvarglömd `avahi-publish-service -s sling _http._tcp
     5399` levde vidare efter att servern dödats med -9, och ingenting lyssnade på
     porten. Samma namn kan bara en publicera — den senaste starten vinner.
+
+    Formen räknas, inte namnet: argv[0] ska vara avahi-publish-service och
+    argv[1:3] exakt ["-s", MDNS_NAME]. Förut räckte det att en främmande process
+    nämnde båda strängarna någonstans i sin kommandorad, och en sådan dödades av
+    start_mdns (mätt: en process med ["avahi-publish-service", "sling"] i argv).
+    Porten lämnas utanför jämförelsen: en kvarglömd publicerare kan peka på en
+    gammal port.
     """
     pids = []
     for n in os.listdir("/proc"):
@@ -493,12 +500,21 @@ def stale_publishers():
             continue
         try:
             with open("/proc/%s/cmdline" % n, "rb") as fh:
-                argv = fh.read().decode("utf-8", "replace").split("\0")
+                argv = [a for a in fh.read().decode("utf-8", "replace").split("\0") if a]
         except OSError:
             continue
-        if not any(os.path.basename(a) == "avahi-publish-service" for a in argv):
+        if not argv:
             continue
-        if MDNS_NAME in argv:              # vår tjänst — inte någon annans
+        # Två former räknas: den riktiga binären (argv[0] är namnet) och ett
+        # skal/manus med shebang (då är argv[0] tolken och argv[1] sökvägen).
+        # I båda fallen måste flaggan och tjänstenamnet stå direkt efter.
+        if os.path.basename(argv[0]) == "avahi-publish-service":
+            rest = argv[1:]
+        elif len(argv) > 1 and os.path.basename(argv[1]) == "avahi-publish-service":
+            rest = argv[2:]
+        else:
+            continue
+        if rest[:2] == ["-s", MDNS_NAME]:
             pids.append(int(n))
     return pids
 
@@ -1308,21 +1324,30 @@ def cmd_start():
 
 
 def pid_is_our_server(pid):
-    """True bara om piden är den här pluginens egen serverprocess.
+    """True bara om piden kör DEN HÄR filen som `server`.
 
-    pid-filen ligger i en privat katalog, men en pid ur en fil är inget att lita på:
-    vi läser /proc/<pid>/cmdline och kräver vårt skriptnamn och "server"-argumentet,
-    och vägrar pida oss själva eller pid 1. En främmande pid nekas i stället för att
-    dödas — oavsett vem som skrev den.
+    Att ett namn finns någonstans i argv räcker inte: `rg server omarchy-sling` —
+    eller en editor öppnad på de två filerna — har båda namnen i sin kommandorad.
+    Mätt: en främmande process med ["server", "omarchy-sling"] i argv pekades ut som
+    vår server och hade dödats av `stop`. Nu krävs formen <tolk> <den här filens
+    sökväg> server: argv[1] måste vara samma fil som den här processen kör (efter
+    realpath, så en symlinkad installation räknas) och argv[2] måste vara "server".
+    En kopia av skriptet på en annan sökväg känns alltså inte igen — hellre att
+    stoppa för lite än att signalera någon annans process.
     """
     if pid <= 1 or pid == os.getpid():
         return False
     try:
         with open("/proc/%d/cmdline" % pid, "rb") as fh:
-            argv = fh.read().decode("utf-8", "replace").split("\0")
+            argv = [a for a in fh.read().decode("utf-8", "replace").split("\0") if a]
     except OSError:
         return False
-    return "server" in argv and any(os.path.basename(a) == "omarchy-sling" for a in argv)
+    if len(argv) < 3 or argv[2] != "server":
+        return False
+    try:
+        return os.path.realpath(argv[1]) == os.path.realpath(__file__)
+    except OSError:
+        return False
 
 
 def server_pids():
@@ -1352,24 +1377,34 @@ def cmd_stop():
             pid = int(fh.read().strip())
     except (OSError, ValueError):
         pass
+    stoppade = False
     if pid and pid_is_our_server(pid):
         try:
             os.kill(pid, signal.SIGTERM)
+            stoppade = True
         except OSError:                 # försvann, eller inte vår att signalera
             pass
-    if port_open():
-        # Fallback när pid-filen saknas eller pekar fel: leta upp våra egna
-        # serverprocesser och pröva var och en innan den signaleras.
+    # Fallback när pid-filen saknas eller pekar fel. Gaten är INTE "någon lyssnar på
+    # porten" — det säger ingenting om att lyssnaren är vår (mätt: med en främmande
+    # lyssnare på porten dödades ändå en process vars kommandorad råkade nämna våra
+    # namn). Först ett svar med VÅR token: det kan bara vår server ge. Sedan
+    # signaleras bara processer som kör den här filen som `server`.
+    token = current_token() or read_token()
+    if token and server_status(token) is not None:
         for annan in server_pids():
             try:
                 os.kill(annan, signal.SIGTERM)
+                stoppade = True
             except OSError:
                 pass
     for _ in range(30):                 # upp till ~3 s på att porten stängs
         if not port_open():
             break
         time.sleep(0.1)
-    print("Sling stopped.")
+    if stoppade or not port_open():
+        print("Sling stopped.")
+    else:
+        print("Nothing of Sling's is listening on port %d — nothing stopped." % PORT)
     return 0
 
 
@@ -1741,6 +1776,17 @@ def cmd_selftest():
             time.sleep(0.4)
             check("kvarglömd publicerare av vårt namn pekas ut",
                   kvarglömd.pid in stale_publishers(), "%s i %s" % (kvarglömd.pid, stale_publishers()))
+            # ... men en främmande process som bara NÄMNER namnen är ingen publicerare:
+            # HANCORE, ärende 10821 — matchen såg namnen var som helst i argv, så en
+            # editor öppnad på de filerna, eller en sökning, dödades av start_mdns.
+            # Formen räknas nu: argv[0] ska vara avahi-publish-service och
+            # argv[1:3] exakt ["-s", tjänstenamnet].
+            namnbärare = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)",
+                                           "avahi-publish-service", globals()["MDNS_NAME"]])
+            time.sleep(0.4)
+            check("främmande process med publicerarens namn i argv pekas inte ut",
+                  namnbärare.pid not in stale_publishers(), "pid %d" % namnbärare.pid)
+            namnbärare.kill()
             # start_mdns() här i provprocessen får inte röra nätet: PATH riktas om
             # till ett skal som misslyckas direkt, så ingen riktig avahi-publicerare
             # startas (en kvarglömd sådan är hela poängen med provet).
@@ -2496,6 +2542,43 @@ def cmd_selftest():
         check("främmande process med vår sträng i kommandoraden pekas inte ut",
               oskyldig.pid not in egna, "oskyldig %d, egna %s" % (oskyldig.pid, egna))
 
+        # HANCORE, ärende 10821: matchen såg namnen var som helst i argv, så
+        # `rg server omarchy-sling` — eller en editor öppnad på de två filerna —
+        # pekades ut som vår server och hade dödats av `stop` (mätt: en främmande
+        # process med ["server", "omarchy-sling"] i argv). Nu måste argv[1] vara
+        # samma fil som den här processen kör och argv[2] vara "server".
+        namnbärare = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)",
+                                       "server", "omarchy-sling"])
+        time.sleep(0.4)
+        check("främmande process med våra namn i argv pekas inte ut som server",
+              not pid_is_our_server(namnbärare.pid) and namnbärare.pid not in server_pids(),
+              "pid %d" % namnbärare.pid)
+
+        # Fallbacken i `stop` var gatad på att PORTEN var öppen, inte på att lyssnaren
+        # var vår: med en främmande lyssnare på porten dödades ändå en process vars
+        # kommandorad råkade nämna våra namn (mätt). Nu krävs ett svar med vår token.
+        främmande_port = sub_port + 10
+        främmande = socket.socket()
+        främmande.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        främmande.bind(("127.0.0.1", främmande_port))
+        främmande.listen(1)
+        sparade_stopp = (globals()["PORT"], globals()["PID_FILE"], globals()["TOKEN_FILE"], globals()["_TOKEN"])
+        globals()["PORT"] = främmande_port
+        globals()["PID_FILE"] = os.path.join(tmp, "ingen-pid-fil")
+        globals()["TOKEN_FILE"] = os.path.join(sub_state, "token")
+        globals()["_TOKEN"] = ""
+        try:
+            cmd_stop()
+        finally:
+            globals()["PORT"], globals()["PID_FILE"] = sparade_stopp[0], sparade_stopp[1]
+            globals()["TOKEN_FILE"], globals()["_TOKEN"] = sparade_stopp[2], sparade_stopp[3]
+            främmande.close()
+        time.sleep(0.3)
+        check("stop rör inget när porten hålls av någon annan",
+              namnbärare.poll() is None and sub_pid in server_pids(),
+              "namnbärare %s, sub-server %s" % (namnbärare.poll(), lever(sub_pid)))
+        namnbärare.kill()
+
         # och stoppet stänger sub-servern (pid-vägen, som är den vanliga)
         stopp = subprocess.run([sys.executable, os.path.abspath(__file__), "stop"], env=sub_env,
                                capture_output=True, text=True, timeout=60)
@@ -2568,6 +2651,32 @@ def cmd_selftest():
                   and os.path.getsize(långsam_fil) == antal * len(bit),
                   "%s efter %.1f s, fil: %s" % (överföringsfel or långsam_svar[:16], tid,
                                                 os.path.getsize(långsam_fil) if os.path.exists(långsam_fil) else "saknas"))
+
+            # Vakt, inte ett nytt fynd: den skärpta grinden får inte göra `stop`
+            # tandlös. Med pid-filen oduglig ska token-handskakningen ändå stänga vår
+            # server (grön både före och efter ändringen — det är hela poängen: att
+            # stoppa för lite vore ett fel det också).
+            sparade_stopp = (globals()["PORT"], globals()["PID_FILE"],
+                             globals()["TOKEN_FILE"], globals()["_TOKEN"])
+            globals()["PORT"] = långsam_port
+            globals()["PID_FILE"] = os.path.join(tmp, "ingen-pid-fil-alls")
+            globals()["TOKEN_FILE"] = os.path.join(långsam_state, "token")
+            globals()["_TOKEN"] = ""
+            try:
+                cmd_stop()
+            finally:
+                globals()["PORT"], globals()["PID_FILE"] = sparade_stopp[0], sparade_stopp[1]
+                globals()["TOKEN_FILE"], globals()["_TOKEN"] = sparade_stopp[2], sparade_stopp[3]
+            time.sleep(0.6)
+            långsam_nere = True
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:%d/t/%s/status" % (långsam_port, långsam_token),
+                                            timeout=3) as r:
+                    långsam_nere = False
+            except Exception:                      # noqa: BLE001 — nere är det väntade
+                pass
+            check("stop hittar servern via token när pid-filen inte duger", långsam_nere,
+                  "svarade fortfarande" if not långsam_nere else "nere")
         finally:
             långsam_srv.terminate()
             try:
