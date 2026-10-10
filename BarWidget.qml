@@ -49,6 +49,7 @@ BarWidget {
       btn_stop: "🛑 Stop",
       btn_start: "▶ Start",
       btn_send: "📤 Send file…",
+      btn_clip: "📋 Send clipboard to phone",
       waiting: "waiting to be fetched",
       hint_start: "Press Start to show the QR code",
       same_wifi: "Same Wi-Fi required",
@@ -69,6 +70,7 @@ BarWidget {
       btn_stop: "🛑 Stäng av",
       btn_start: "▶ Starta",
       btn_send: "📤 Skicka fil…",
+      btn_clip: "📋 Skicka urklipp till telefonen",
       waiting: "väntar att hämtas",
       hint_start: "Tryck Starta för att visa QR-koden",
       same_wifi: "Kräver samma Wi-Fi",
@@ -89,6 +91,7 @@ BarWidget {
       btn_stop: "🛑 Stoppen",
       btn_start: "▶ Starten",
       btn_send: "📤 Bestand sturen…",
+      btn_clip: "📋 Klembord naar telefoon",
       waiting: "wacht om opgehaald te worden",
       hint_start: "Druk op Starten voor de QR-code",
       same_wifi: "Vereist dezelfde Wi-Fi",
@@ -109,6 +112,7 @@ BarWidget {
       btn_stop: "🛑 停止",
       btn_start: "▶ 開始",
       btn_send: "📤 ファイルを送信…",
+      btn_clip: "📋 クリップボードをスマホへ",
       waiting: "取得待ち",
       hint_start: "開始を押すとQRコードを表示します",
       same_wifi: "同じWi-Fi接続が必要です",
@@ -129,6 +133,7 @@ BarWidget {
       btn_stop: "🛑 Beenden",
       btn_start: "▶ Starten",
       btn_send: "📤 Datei senden…",
+      btn_clip: "📋 Zwischenablage ans Handy",
       waiting: "warten auf Abruf",
       hint_start: "Start drücken, um den QR-Code zu zeigen",
       same_wifi: "Gleiches WLAN erforderlich",
@@ -149,6 +154,7 @@ BarWidget {
       btn_stop: "🛑 Arrêter",
       btn_start: "▶ Démarrer",
       btn_send: "📤 Envoyer un fichier…",
+      btn_clip: "📋 Envoyer le presse-papiers au téléphone",
       waiting: "en attente de téléchargement",
       hint_start: "Appuyez sur Démarrer pour afficher le QR",
       same_wifi: "Même Wi-Fi requis",
@@ -169,6 +175,7 @@ BarWidget {
       btn_stop: "🛑 Detener",
       btn_start: "▶ Iniciar",
       btn_send: "📤 Enviar archivo…",
+      btn_clip: "📋 Enviar el portapapeles al teléfono",
       waiting: "esperando descarga",
       hint_start: "Pulsa Iniciar para ver el código QR",
       same_wifi: "Misma red Wi-Fi requerida",
@@ -189,6 +196,7 @@ BarWidget {
       btn_stop: "🛑 停止",
       btn_start: "▶ 启动",
       btn_send: "📤 发送文件…",
+      btn_clip: "📋 发送剪贴板到手机",
       waiting: "等待获取",
       hint_start: "点击启动显示二维码",
       same_wifi: "需要连接到同一 Wi-Fi",
@@ -258,6 +266,20 @@ BarWidget {
 
   // Kopieringen görs av CLI:t: URL:en (med token) går på stdin till wl-copy, så den
   // syns varken i argv eller hänger på att en QML-process stänger sin pipe (mätt).
+  // Filen som släpps på bar-ikonen går rakt in i skicka-kön — samma väg som
+  // "Skicka fil…", men utan fönsterval. drop.urls är file://-URL:er.
+  function queueDrop(urls) {
+    var paths = []
+    for (var i = 0; i < urls.length; i++) {
+      var u = String(urls[i])
+      if (u.indexOf("file://") === 0)
+        paths.push(decodeURIComponent(u.slice(7)))
+    }
+    if (paths.length === 0) return
+    root.runSling.apply(null, ["send"].concat(paths))
+    root.popupOpen = true          // kvitto: kön syns direkt i panelen
+  }
+
   function copyUrl(which) {
     root.runSling("copy", which)
     if (root.bar) root.bar.showTooltip(root, root.str.copied)
@@ -290,6 +312,14 @@ BarWidget {
         runSling("start")
       }
       root.popupOpen = !root.popupOpen
+    }
+
+    DropArea {
+      anchors.fill: parent
+      onDropped: function(drop) {
+        root.queueDrop(drop.urls)
+        drop.accept()
+      }
     }
   }
 
@@ -815,6 +845,15 @@ BarWidget {
           verticalPadding: Style.spacing.controlPaddingY
           onClicked: root.runSling("send-pick")
         }
+      }
+
+      Button {
+        width: parent.width
+        text: root.str.btn_clip
+        foreground: root.bar.foreground
+        horizontalPadding: Style.spacing.controlPaddingX
+        verticalPadding: Style.spacing.controlPaddingY
+        onClicked: root.runSling("clip")
       }
 
       Button {

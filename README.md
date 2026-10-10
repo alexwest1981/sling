@@ -36,7 +36,7 @@ Current version: `1.3.0`.
 
 Only `qrencode` is required; the rest degrade gracefully — the panel reports what is missing (`omarchy-sling status` → `"qr_ok": false`) instead of showing a blank square. The daemon itself is Python 3 standard library only.
 
-Verify a build at any time — `selftest` starts its own server on a spare port in a scratch directory and runs **42 checks**: files of four sizes uploaded and compared byte for byte, the token gate (403), the size cap (413), duplicate names, queue deduplication and removal (the source file always survives), the connection cap and read deadline (threads and file descriptors stay bounded when a silent peer opens more connections than the cap), and that a running transfer is visible through both the server's `/status` and the CLI the panel polls:
+Verify a build at any time — `selftest` starts its own server on a spare port in a scratch directory and runs **47 checks**: files of four sizes uploaded and compared byte for byte, the token gate (403), the size cap (413), duplicate names, queue deduplication and removal (the source file always survives), the connection cap and read deadline (threads and file descriptors stay bounded when a silent peer opens more connections than the cap), the clipboard in both directions (the shared text never reaches argv or a notification), and that a running transfer is visible through both the server's `/status` and the CLI the panel polls:
 
 ```bash
 omarchy-sling selftest
@@ -87,7 +87,7 @@ omarchy-restart-shell
 
 ## 🕹️ Usage
 
-**From the panel:** click the bar icon — the server starts and the QR code appears inside the neon reticle. Below it: the `sling.local` address, the transfer dock (which reads *Ready — waiting for a file* when nothing is moving), the send queue and the last received files. The queue lists the first five files waiting for the phone with a `✕` per file, plus **📁 Open Send folder** and **🗑 Clear all** — a `+ N more…` line opens the folder. Buttons: **📁 Open folder**, **📤 Send file…**, **▶ Start / 🛑 Stop**.
+**From the panel:** click the bar icon — the server starts and the QR code appears inside the neon reticle. **Drag a file onto the bar icon** and it is queued for the phone immediately (no picker window). Below it: the `sling.local` address, the transfer dock (which reads *Ready — waiting for a file* when nothing is moving), the send queue and the last received files. The queue lists the first five files waiting for the phone with a `✕` per file, plus **📁 Open Send folder** and **🗑 Clear all** — a `+ N more…` line opens the folder. Buttons: **📁 Open folder**, **📤 Send file…**, **📋 Send clipboard to phone** (the phone reads it in its *Clipboard* card, and can paste text back the other way), **▶ Start / 🛑 Stop**.
 
 **From the terminal:**
 
@@ -98,15 +98,16 @@ omarchy-sling send ~/Pictures/a.jpg  # queue files for the phone (symlinked, nev
 omarchy-sling send-pick              # queue files via a file picker
 omarchy-sling remove a.jpg           # unlink one file from the queue (the original is untouched)
 omarchy-sling clear                  # empty the whole queue
+omarchy-sling clip                   # share the PC clipboard with the phone (panel button too)
 omarchy-sling copy [mdns]            # put the token URL in the clipboard (wm-agnostic stdin, never argv)
 omarchy-sling open [send|received]   # open the Received (default) or Send folder
 omarchy-sling stop                   # stop now (SIGTERM, then SIGKILL)
-omarchy-sling selftest               # the 42 checks above
+omarchy-sling selftest               # the 47 checks above
 ```
 
 `status` reports the running transfer under `active` (direction, file name, bytes, total, percentage and speed), read from the server itself — the same values the panel draws.
 
-Environment overrides: `SLING_PORT` (5380), `SLING_IDLE_TIMEOUT` (900 s), `SLING_MAX_UPLOAD` (2 GiB per request), `SLING_MAX_CONNECTIONS` (32), `SLING_SOCKET_TIMEOUT` (30 s), `SLING_BASE_DIR` (`~/Downloads/Sling`), `SLING_MDNS_NAME` (`sling`).
+Environment overrides: `SLING_PORT` (5380), `SLING_IDLE_TIMEOUT` (900 s), `SLING_MAX_UPLOAD` (2 GiB per request), `SLING_MAX_CONNECTIONS` (32), `SLING_SOCKET_TIMEOUT` (30 s), `SLING_CLIP_MAX` (64 KB), `SLING_BASE_DIR` (`~/Downloads/Sling`), `SLING_MDNS_NAME` (`sling`).
 
 ---
 
@@ -118,6 +119,7 @@ The server has to listen on `0.0.0.0:5380` — the phone must reach it — so th
 2. **Auto-disarm.** No traffic for `SLING_IDLE_TIMEOUT` (15 min by default) and the process exits, deleting its token.
 3. **A hard size cap.** `SLING_MAX_UPLOAD` is checked before the body is read, so a hostile client cannot fill the disk.
 4. **Bounded connections and reads.** The token is checked only once a request has been read, so the socket has to be bounded before that: at most `SLING_MAX_CONNECTIONS` (32) connections are accepted at a time — the rest get `503` and are closed instead of being queued — and every connection has a `SLING_SOCKET_TIMEOUT` (30 s) deadline per read and write, so a peer that connects and then says nothing releases its thread and file descriptor. Measured: 200 silent connections take the server to 34 threads / 36 fds (2/4 at rest) and back down again; before the cap the same 200 held 202 threads / 204 fds.
+5. **The clipboard is opt-in, one direction at a time.** The phone can only read what *you* pushed with **📋 Send clipboard to phone** (or `omarchy-sling clip`): a single `0600` file in `~/Downloads/Sling/`, at most `SLING_CLIP_MAX` (64 KB), served only when the phone asks for it. Nothing else from your clipboard is ever exposed. Text sent from the phone goes to your clipboard through `wl-copy` on stdin — like the token URL, it never appears in a process argument list, and the notification says only that something arrived, never what.
 
 Traffic is plain HTTP (no TLS) — anyone able to sniff your Wi-Fi can see file contents in transit. On your own home network that is the tradeoff; on an open network, transfer only between devices you trust.
 
