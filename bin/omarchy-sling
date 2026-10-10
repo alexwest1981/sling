@@ -50,7 +50,13 @@ SEND_DIR = os.path.join(BASE_DIR, "Send")
 # lösenord.
 CLIP_PATH = os.path.join(BASE_DIR, ".clipboard")
 
-STATE_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "sling")
+# Tillståndet (token, pid, url, qr) får bara ligga där ingen annan lokal användare kan
+# skriva. XDG_RUNTIME_DIR är per användare och 0700; finns den inte får vi INTE falla
+# tillbaka på /tmp — vem som helst kan skapa /tmp/sling först, äga katalogen och läsa
+# token ur den (och byta pid-filen). Fall tillbaka på samma privata plats som loggen.
+STATE_ROOT = os.environ.get("XDG_RUNTIME_DIR") or os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "run")
+STATE_DIR = os.path.join(STATE_ROOT, "sling")
 QR_PATH = os.path.join(STATE_DIR, "qr.png")
 URL_FILE = os.path.join(STATE_DIR, "url")
 PID_FILE = os.path.join(STATE_DIR, "pid")
@@ -59,25 +65,42 @@ LOG_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.l
 LOG_PATH = os.path.join(LOG_DIR, "server.log")
 
 DEFAULT_BASE = os.path.join(os.path.expanduser("~"), "Downloads", "Sling")
-for _d in (BASE_DIR, RECEIVED_DIR, SEND_DIR, STATE_DIR, LOG_DIR):
-    # 0700: loggen namnger mottagna filer, och urklippsloten ligger direkt i basen —
-    # ingen annan lokal användare ska kunna läsa eller gå igenom dem.
-    os.makedirs(_d, mode=0o700, exist_ok=True)
-    # Redan skapade kataloger behåller sin gamla mode; sätt om varje gång. Bara den
-    # egna basen tvingas: pekar SLING_BASE_DIR någon annanstans (en delad katalog) är
-    # det användarens val, och att chmodda den vore att ändra något vi inte äger.
-    _hard = (_d == DEFAULT_BASE or _d.startswith(DEFAULT_BASE + os.sep)
-             or _d in (STATE_DIR, LOG_DIR))
-    if _hard:
-        try:
-            os.chmod(_d, 0o700)
-        except OSError:
-            pass
-if os.path.exists(LOG_PATH):
-    try:
+
+
+def harden_dirs():
+    """Sätter mode på katalogerna och skapar loggen 0600 innan någon skriver i den.
+
+    Tillstånds- och loggkatalogen bär token, pid och namnen på mottagna filer: är de
+    inte våra egna (en främmande ägare eller en symlink någon planterat) vägrar vi
+    hellre än skriver dit. Övriga kataloger härdas bara när de är den egna basen —
+    pekar SLING_BASE_DIR någon annanstans kan det vara en katalog användaren valt att
+    dela, och att chmodda den vore att ändra något vi inte äger. Loggen skapas 0600
+    här, så att cmd_starts open(..., "a") ärver rätt mode i stället för umaskens.
+    """
+    for path in (BASE_DIR, RECEIVED_DIR, SEND_DIR, STATE_DIR, LOG_DIR):
+        privat = path in (STATE_DIR, LOG_DIR)
+        if privat and os.path.islink(path):
+            raise SystemExit("Sling: %s är en symlink — vägrar lägga token, pid och "
+                             "logg där någon annan kan ha placerat den." % path)
+        if privat and os.path.exists(path) and os.stat(path).st_uid != os.getuid():
+            raise SystemExit("Sling: %s ägs av någon annan — vägrar lägga token, pid "
+                             "och logg där." % path)
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        if not os.path.isdir(path) or os.stat(path).st_uid != os.getuid():
+            raise SystemExit("Sling: %s ägs inte av dig — vägrar använda den." % path)
+        # Redan skapade kataloger behåller sin gamla mode; sätt om varje gång.
+        if privat or path == DEFAULT_BASE or path.startswith(DEFAULT_BASE + os.sep):
+            try:
+                os.chmod(path, 0o700)
+            except OSError:
+                pass
+    if os.path.exists(LOG_PATH):
         os.chmod(LOG_PATH, 0o600)
-    except OSError:
-        pass
+    else:
+        os.close(os.open(LOG_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600))
+
+
+harden_dirs()
 
 LAST_ACTIVITY = {"t": time.monotonic()}
 _TOKEN = ""
@@ -361,6 +384,21 @@ def start_mdns():
 # ------------------------------------------------------------------------------
 # Multipart som strömmar till disk
 # ------------------------------------------------------------------------------
+def safe_upload_name(raw):
+    """Filnamnet ur en multipart-rubrik — eller "" om det inte får bli en fil.
+
+    Mätt: `open()` på ett namn med NUL kastar ValueError, som do_POST:s except OSError
+    inte fångar; då dör anropet utan svar och de filer som kom efter i samma POST
+    försvinner tyst. Ett namn med radbrytning skulle skriva egna rader i loggen.
+    """
+    name = os.path.basename(raw)
+    if not name or name in (".", "..") or len(name.encode("utf-8", "replace")) > 200:
+        return ""
+    if any(ord(ch) < 32 for ch in name):
+        return ""
+    return name
+
+
 def stream_multipart(rfile, content_type, content_length, save_dir, on_progress=None):
     """Läser multipart-kroppen i bitar och skriver varje fil direkt till disk.
 
@@ -430,7 +468,7 @@ def stream_multipart(rfile, content_type, content_length, save_dir, on_progress=
                 headers = buf[:j].decode("utf-8", "replace")
                 buf = buf[j + 4:]
                 fn = re.search(r'filename="([^"]*)"', headers)
-                name = os.path.basename(fn.group(1)) if fn else ""
+                name = safe_upload_name(fn.group(1)) if fn else ""
                 if name:
                     path = unique_path(save_dir, name)
                     out = (path, open(path, "wb"))
@@ -885,7 +923,9 @@ class SlingHandler(BaseHTTPRequestHandler):
             # Läsdeadlinen slog till mitt i kroppen: klienten är borta, kasta
             # anslutningen (handle_one_request) i stället för att svara på den.
             raise
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
+            # ValueError: ett filnamn ur multipart-rubriken kan innehålla NUL, och open()
+            # kastar då — utan det här hade anropet dött utan svar (se safe_upload_name).
             log("uppladdning misslyckades: %s" % exc)
             self._send(500, json.dumps({"ok": False, "error": str(exc)}).encode(), "application/json")
             return
@@ -1054,6 +1094,24 @@ def cmd_start():
     return 1
 
 
+def pid_is_our_server(pid):
+    """True bara om piden är den här pluginens egen serverprocess.
+
+    pid-filen ligger i en privat katalog, men en pid ur en fil är inget att lita på:
+    vi läser /proc/<pid>/cmdline och kräver vårt skriptnamn och "server"-argumentet,
+    och vägrar pida oss själva eller pid 1. En främmande pid nekas i stället för att
+    dödas — oavsett vem som skrev filen.
+    """
+    if pid <= 1 or pid == os.getpid():
+        return False
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            argv = fh.read().decode("utf-8", "replace").split("\0")
+    except OSError:
+        return False
+    return "server" in argv and any(os.path.basename(a) == "omarchy-sling" for a in argv)
+
+
 def cmd_stop():
     pid = None
     try:
@@ -1061,14 +1119,14 @@ def cmd_stop():
             pid = int(fh.read().strip())
     except (OSError, ValueError):
         pass
-    if pid:
+    if pid and pid_is_our_server(pid):
         try:
             os.kill(pid, signal.SIGTERM)
             for _ in range(30):
                 if not port_open():
                     break
                 time.sleep(0.1)
-        except ProcessLookupError:
+        except OSError:                 # försvann, eller inte vår att signalera
             pass
     if port_open():
         subprocess.run(["pkill", "-f", "omarchy-sling server"], check=False)
@@ -1238,6 +1296,7 @@ def cmd_selftest():
                SLING_MAX_CONNECTIONS="8",             # taket prövas nedan
                SLING_SOCKET_TIMEOUT="3",
                XDG_RUNTIME_DIR=tmp,
+               XDG_STATE_HOME=tmp,
                SLING_MDNS_NAME="sling-test")
     proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), "server"],
                             env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -1290,6 +1349,48 @@ def cmd_selftest():
         _ddir = os.path.join(tmp, "sling")
         check("tillståndskatalogen tvingas till 0700", stat.S_IMODE(os.stat(_ddir).st_mode) == 0o700,
               oct(stat.S_IMODE(os.stat(_ddir).st_mode))[-3:])
+        _logg = os.path.join(_ddir, "server.log")
+        _mode = stat.S_IMODE(os.stat(_logg).st_mode)
+        check("loggfilen skapas med 0600 (inget fönster)", _mode == 0o600, oct(_mode)[-3:])
+
+        # Tillståndet får inte hamna i /tmp när XDG_RUNTIME_DIR saknas: där kan vem som
+        # helst skapa katalogen först och läsa token ur den. Och en katalog som någon
+        # annan håller i ska vi vägra skriva i, inte skriva i ändå.
+        _utan = {k: v for k, v in os.environ.items() if k != "XDG_RUNTIME_DIR"}
+        _utan["XDG_STATE_HOME"] = os.path.join(tmp, "statefall")
+        _kod = ("import importlib.machinery as m, importlib.util as u, sys\n"
+                "l = m.SourceFileLoader('sling', sys.argv[1])\n"
+                "s = u.module_from_spec(u.spec_from_loader('sling', l))\n"
+                "l.exec_module(s)\n"
+                "print(s.STATE_DIR)\n")
+        _r = subprocess.run([sys.executable, "-c", _kod, os.path.abspath(__file__)],
+                            env=_utan, capture_output=True, text=True, timeout=30)
+        _fall = _r.stdout.strip()
+        check("utan XDG_RUNTIME_DIR hamnar tillståndet inte i /tmp",
+              _r.returncode == 0 and _fall and not _fall.startswith("/tmp") and os.path.isabs(_fall), _fall or _r.stderr[-80:])
+
+        _fientlig = os.path.join(tmp, "fientlig")
+        os.makedirs(os.path.join(_fientlig, "run"), exist_ok=True)
+        os.symlink(os.path.join(tmp, "Received"), os.path.join(_fientlig, "run", "sling"))
+        _r2 = subprocess.run([sys.executable, os.path.abspath(__file__), "status"],
+                             env=dict(os.environ, SLING_BASE_DIR=_fientlig,
+                                      XDG_RUNTIME_DIR=os.path.join(_fientlig, "run"),
+                                      XDG_STATE_HOME=os.path.join(_fientlig, "state")),
+                             capture_output=True, text=True, timeout=30)
+        check("vägrar skriva tillstånd i en symlinkad katalog",
+              _r2.returncode != 0 and "symlink" in (_r2.stderr + _r2.stdout).lower(),
+              "%s: %s" % (_r2.returncode, (_r2.stderr + _r2.stdout).strip().splitlines()[-1:]))
+
+        # En pid ur en fil är inget att lita på: bara vår egen server får signaleras.
+        _fras = subprocess.Popen(["sleep", "30"])
+        try:
+            check("främmande pid nekas (även oss själva och pid 1)",
+                  not pid_is_our_server(_fras.pid) and not pid_is_our_server(os.getpid())
+                  and not pid_is_our_server(1) and _fras.poll() is None)
+            check("vår egen server känns igen", pid_is_our_server(proc.pid), "pid %d" % proc.pid)
+        finally:
+            _fras.terminate()
+            _fras.wait(timeout=10)
 
         payloads = [
             ("tom.bin", b""),
@@ -1305,6 +1406,19 @@ def cmd_selftest():
             check("byte-identisk: %s (%d B)" % (name, len(data)), ok)
             if not ok:
                 break
+
+        # En fil med NUL i namnet fick open() att kasta ValueError (do_POST fångade bara
+        # OSError): anropet dog utan svar och filerna efter den i samma POST försvann.
+        code, reply = post([("forst.bin", b"A"), ("nu\0ll.bin", b"B"), ("sist.bin", b"C")], token)
+        _sav = reply.get("saved", [])
+        check("filnamn med NUL-tecken hoppas över, resten kommer fram",
+              code == 200 and _sav == ["forst.bin", "sist.bin"], "%s: %s" % (code, _sav))
+        check("  ... och ingen fil med NUL i namnet skapades",
+              not [f for f in os.listdir(os.path.join(tmp, "Received")) if "ll.bin" in f])
+
+        code, reply = post([("..", b"X")], token)
+        check("filnamnet '..' blir ingen fil", code == 200 and reply.get("saved") == [],
+              "%s: %s" % (code, reply.get("saved")))
 
         # En kropp som innehåller själva gränssträngen går inte att representera i
         # multipart (avsändaren ska välja en gräns som inte förekommer i innehållet).

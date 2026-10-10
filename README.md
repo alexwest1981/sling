@@ -36,7 +36,7 @@ Current version: `1.3.0`.
 
 Only `qrencode` is required; the rest degrade gracefully — the panel reports what is missing (`omarchy-sling status` → `"qr_ok": false`) instead of showing a blank square. The daemon itself is Python 3 standard library only.
 
-Verify a build at any time — `selftest` starts its own server on a spare port in a scratch directory and runs **55 checks**: files of four sizes uploaded and compared byte for byte, the token gate (403), the size cap (413), duplicate names, queue deduplication and removal (the source file always survives), the connection cap and read deadline (threads and file descriptors stay bounded when a silent peer opens more connections than the cap), the clipboard in both directions (the shared text never reaches argv or a notification, and the slot, the token file and the state directory are created with 0600/0700 from the start, never chmodded afterwards), and that a running transfer is visible through both the server's `/status` and the CLI the panel polls:
+Verify a build at any time — `selftest` starts its own server on a spare port in a scratch directory and runs **63 checks**: files of four sizes uploaded and compared byte for byte, the token gate (403), the size cap (413), duplicate names, queue deduplication and removal (the source file always survives), the connection cap and read deadline (threads and file descriptors stay bounded when a silent peer opens more connections than the cap), the clipboard in both directions (the shared text never reaches argv or a notification, and the slot, the token file and the state directory are created with 0600/0700 from the start, never chmodded afterwards), that the state directory stays out of `/tmp` when `XDG_RUNTIME_DIR` is unset and that a state directory planted as a symlink is refused instead of written into, that a pid file naming someone else's process is refused rather than signalled, that a filename carrying a NUL byte or `..` is skipped while the rest of the same upload still arrives, and that a running transfer is visible through both the server's `/status` and the CLI the panel polls:
 
 ```bash
 omarchy-sling selftest
@@ -110,7 +110,7 @@ omarchy-sling clip                   # share the PC clipboard with the phone (pa
 omarchy-sling copy [mdns]            # put the token URL in the clipboard (wm-agnostic stdin, never argv)
 omarchy-sling open [send|received]   # open the Received (default) or Send folder
 omarchy-sling stop                   # stop now (SIGTERM, then SIGKILL)
-omarchy-sling selftest               # the 55 checks above
+omarchy-sling selftest               # the 63 checks above
 ```
 
 `status` reports the running transfer under `active` (direction, file name, bytes, total, percentage and speed), read from the server itself — the same values the panel draws.
@@ -131,7 +131,9 @@ The server has to listen on `0.0.0.0:5380` — the phone must reach it — so th
 
 Traffic is plain HTTP (no TLS) — anyone able to sniff your Wi-Fi can see file contents in transit. On your own home network that is the tradeoff; on an open network, transfer only between devices you trust.
 
-Uploads are streamed straight to disk with a bounded buffer (a 150 MB file costs about 0.6 MB of resident memory, measured), filenames are HTML-escaped so a crafted name cannot inject script into the phone's page, and downloads are sent with an RFC 5987 encoded `Content-Disposition` so a filename cannot inject headers.
+Uploads are streamed straight to disk with a bounded buffer (a 150 MB file costs about 0.6 MB of resident memory, measured), filenames are HTML-escaped so a crafted name cannot inject script into the phone's page, and downloads are sent with an RFC 5987 encoded `Content-Disposition` so a filename cannot inject headers. A filename that is not a plain name — empty, `.`, `..`, or carrying control characters — is skipped instead of written, and the rest of the same upload still arrives.
+
+Two limits belong to the machine rather than to the code, and both are stated here instead of being papered over. On a shared machine another account can bind port 5380 first, and since the phone authenticates the *server* only by the token in a plain-HTTP URL, it would then upload to that process rather than to yours — the token is not a defence against a squatter on this machine, only against everyone on the network. And the state directory (`$XDG_RUNTIME_DIR/sling`, falling back to `~/.local/state/run/sling` — never `/tmp`, where anyone can create the name first and then read the token) refuses to be used at all if it is a symlink or owned by another account. `omarchy-sling stop` likewise verifies the pid against `/proc/<pid>/cmdline` before signalling, so a pid file cannot turn a stop into a signal aimed at some other process.
 
 **The token never appears in a process argument list.** Another local account can read `ps` output, so the URL — which carries the token — goes to `qrencode` on stdin, and clipboard copies pipe it to `wl-copy` instead of passing it as an argument. Notifications carry only a file *count*, never file names. The token file is `0600` inside a `0700` directory, the server log is `0600` for the same reason (it names received files), and `selftest` asserts the stdin-not-argv rule for both the QR code and the clipboard.
 
