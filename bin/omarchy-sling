@@ -49,6 +49,11 @@ MAX_PARTS = int(os.environ.get("SLING_MAX_PARTS", "1000"))
 # det innan kroppen läses. ponytail: ett golv, ingen bokföring; en tokenhållare kan fylla
 # partitionen ned till golvet och inget här raderar något — återvinning är en egen fråga.
 MIN_FREE = int(os.environ.get("SLING_MIN_FREE", 256 * 1024 * 1024))
+# Golv för fria inoder. Byte-golvet säger ingenting om inoderna: mätt gav 1000 tomma delar
+# 1000 filer och flyttade fria byte med exakt 0 (en tom fil kostar en inod och inget
+# block). Inoder räknas bara där filsystemet har ett fast antal — btrfs rapporterar
+# f_files = 0 och har ingen gräns att slå i, och en kontroll som låtsades annat vore fel.
+MIN_FREE_FILES = int(os.environ.get("SLING_MIN_FREE_FILES", "1000"))
 # Tak för samtidiga anslutningar och tystnad per anslutning. Token kontrolleras
 # först när förfrågan är läst, så utan tak kan en granne på LAN:et öppna
 # anslutningar, tiga, och hålla en tråd och en fildeskriptor per anslutning.
@@ -98,6 +103,20 @@ SEND_DIR = os.path.join(BASE_DIR, "Send")
 # listas som hämtbar fil eller blandas ihop med dem. 0600: urklipp kan vara
 # lösenord.
 CLIP_PATH = os.path.join(BASE_DIR, ".clipboard")
+
+
+def utrymme_slut(längd, katalog=RECEIVED_DIR, vfs=None):
+    """Får en kropp på `längd` byte plats med utrymmesgolvet kvar?
+
+    Byte alltid; inoder bara när filsystemet har ett fast antal (se MIN_FREE_FILES).
+    `vfs` finns för sviten: den här maskinens filsystem (btrfs) rapporterar 0 inoder,
+    så inodregeln kan bara prövas mot en påhittad statvfs (samma skäl som
+    granska_sankor tar `text=`).
+    """
+    if shutil.disk_usage(katalog).free - längd < MIN_FREE:
+        return True
+    vfs = vfs or os.statvfs(katalog)
+    return vfs.f_files > 0 and vfs.f_ffree < MIN_FREE_FILES + MAX_PARTS
 
 # Tillståndet (token, pid, url, qr) får bara ligga där ingen annan lokal användare kan
 # skriva. XDG_RUNTIME_DIR är per användare och 0700; finns den inte får vi INTE falla
@@ -1145,6 +1164,11 @@ class SlingHandler(BaseHTTPRequestHandler):
         if body:
             self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        # Token ligger i URL:en, så rubrikerna som betyder något här är de som hindrar
+        # den från att följa med någon annanstans, och de som hindrar en webbläsare från
+        # att gissa innehållstyp. Mätt: svaret bar bara Server och Cache-Control.
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
         for key, value in (extra or {}).items():
             self.send_header(key, value)
         self.end_headers()
@@ -1252,6 +1276,10 @@ class SlingHandler(BaseHTTPRequestHandler):
                 # RFC 5987-formen klarar icke-ASCII och kan inte injicera rubriker.
                 self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + urllib.parse.quote(name))
                 self.send_header("Content-Length", str(size))
+                # Nedladdningen strömmar sin kropp och går därför inte genom _send;
+                # samma två rubriker sätts här (se _send).
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("X-Content-Type-Options", "nosniff")
                 self.end_headers()
                 träff = start_transfer("down", name, size)
                 # Svaret har sin egen absoluta frist (se skriv_takad): en motpart som läser
@@ -1350,9 +1378,9 @@ class SlingHandler(BaseHTTPRequestHandler):
         # en kvotbokföring: utrymmet är redan känt, och det skyddar allt annat på samma
         # partition också. En lögnaktig Content-Length kostar inget — kontrollen sker före
         # första läsningen, och kroppen läses bara så långt tömningen går.
-        if shutil.disk_usage(RECEIVED_DIR).free - length < MIN_FREE:
-            log("avvisade uppladdning på %d byte (%d byte ledigt, golv %d)"
-                % (length, shutil.disk_usage(RECEIVED_DIR).free, MIN_FREE))
+        if utrymme_slut(length):
+            log("avvisade uppladdning på %d byte (utrymmet under golvet: %d byte ledigt, %d inoder)"
+                % (length, shutil.disk_usage(RECEIVED_DIR).free, os.statvfs(RECEIVED_DIR).f_ffree))
             self._släpp_kroppen(length)
             self._send(507, json.dumps({"ok": False, "error": "not enough room"}).encode(),
                        "application/json")
@@ -2316,6 +2344,23 @@ def cmd_selftest(abuse=False):
               _familje_ok(_pin, "läsningar") is True)
         check("en extra otakad läsning i en pinnad funktion blir röd",
               _familje_ok(_pin_extra, "läsningar") is False)
+
+        # Utrymmesgolvets inodsida, prövad mot en påhittad statvfs: den här maskinens
+        # filsystem (btrfs) har ingen fast inodtabell och rapporterar 0, så en körning mot
+        # den riktiga disken hade bevisat ingenting (mätt: 1000 tomma delar gav 1000 filer
+        # och flyttade fria byte med exakt 0 — byte-golvet sa ingenting).
+        _vfs = lambda **kw: type("vfs", (), kw)   # noqa: E731 — en statvfs i miniatyr
+        # Katalogen ges explicit: sviten ska inte röra (eller förutsätta) användarens
+        # ~/Downloads/Sling för att pröva en regel.
+        _här = os.path.dirname(os.path.abspath(__file__))
+        check("ett filsystem utan fasta inoder stänger inte dörren (btrfs)",
+              utrymme_slut(0, katalog=_här, vfs=_vfs(f_files=0, f_ffree=0)) is False)
+        check("för få fria inoder vägrar kroppen",
+              utrymme_slut(0, katalog=_här,
+                           vfs=_vfs(f_files=1 << 20, f_ffree=MIN_FREE_FILES + MAX_PARTS - 1)) is True)
+        check("precis på inodgolvet går igenom",
+              utrymme_slut(0, katalog=_här,
+                           vfs=_vfs(f_files=1 << 20, f_ffree=MIN_FREE_FILES + MAX_PARTS)) is False)
 
         # Inventeringen: klassen, inte fyndet. Varje strypkoppling i filen — varje
         # processanrop, läsning, väntan och nätläsning — måste vara takad eller stå
@@ -4046,6 +4091,19 @@ def cmd_abuse(h, port, token, tmp):
     check("abuse: ett 400 byte långt hämtnamn ger 404", kod(svar) in (0, 400, 404) and lever_efter(), "kod %d" % kod(svar))
     svar, _ = raw(b"GET /t/%s/download/l%%C3%%A4nkad.bin HTTP/1.0\r\n\r\n" % token.encode())
     check("abuse: en länk i kön följs till sin källa (det är kön)", kod(svar) == 200 and b"or" in svar, "kod %d" % kod(svar))
+    # Rubrikerna på det telefonen laddar: token ligger i URL:en, så det som betyder något är
+    # att den inte följer med någon annanstans (Referrer-Policy) och att webbläsaren inte
+    # gissar innehållstyp (nosniff). Mätt före: svaren bar bara Server och Cache-Control.
+    for _väg, _vad in ((b"GET /t/%s/ HTTP/1.0\r\n\r\n", "sidan"),
+                       (b"GET /t/%s/status HTTP/1.0\r\n\r\n", "/status"),
+                       (b"GET /t/%s/download/h%%C3%%A4mtbar.bin HTTP/1.0\r\n\r\n", "hämtningen")):
+        _svar, _ = raw(_väg % token.encode(), stop_after=200000)
+        _huvud = _svar.split(b"\r\n\r\n", 1)[0].lower()
+        check("abuse: %s bär Referrer-Policy och nosniff" % _vad,
+              b"referrer-policy: no-referrer" in _huvud and b"x-content-type-options: nosniff" in _huvud,
+              "huvud: %s" % [h.decode(errors="replace") for h in _huvud.split(b"\r\n")
+                             if b"referrer" in h or b"nosniff" in h])
+
     s = socket.create_connection(("127.0.0.1", port), timeout=6)
     try:
         s.sendall(b"GET /t/%s/download/stor-i-kon.bin HTTP/1.0\r\n\r\n" % token.encode())
