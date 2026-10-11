@@ -2493,6 +2493,38 @@ def cmd_selftest(abuse=False):
               bool(dock) and bool(nycklar) and not saknas,
               "nycklar: %s | saknas: %s" % (sorted(nycklar), saknas) if qml else "BarWidget.qml går inte att läsa")
 
+        # AutoText-klassen har kostat tre rundor: först filnamnen i kön och de mottagna
+        # raderna, sedan de överföringsuppgifter servern skickar (human_done/human_total).
+        # En text utan Text.PlainText tolkas som rik text, så ett namn eller ett tal med en
+        # <img>-tagg får den långlivade shellen att hämta en främmande URL — utan gräns för
+        # svarets storlek. Regeln är därför hela filen och inte de namngivna raderna: varje
+        # Text-block i panelen måste bära Text.PlainText, och ett nytt block utan den blir
+        # rött. (Riktig text behövs ingenstans i den här panelen: allt den visar är namn,
+        # tal och etiketter.)
+        # Blocken hittas med klammerbalans, inte med radnummer: en ny Text mitt i filen
+        # ska räknas in utan att kontrollen behöver röras.
+        _utan = []
+        _i = 0
+        _rader = qml.split("\n")
+        while _i < len(_rader):
+            if re.match(r"\s*Text\s*\{\s*$", _rader[_i]):
+                _d = _rader[_i].count("{") - _rader[_i].count("}")
+                _blk = [_rader[_i]]
+                _j = _i + 1
+                while _j < len(_rader) and _d > 0:
+                    _blk.append(_rader[_j])
+                    _d += _rader[_j].count("{") - _rader[_j].count("}")
+                    _j += 1
+                if not any("textFormat" in _x for _x in _blk):
+                    _utan.append(_i + 1)
+                _i = _j
+            else:
+                _i += 1
+        _alla = len(re.findall(r"^\s*Text\s*\{", qml, re.M))
+        check("varje Text-block i panelen är klartext (%d block)" % _alla,
+              _alla > 0 and not _utan,
+              "block utan Text.PlainText: %s" % (_utan or "inga"))
+
         # Inventeringen: klassen, inte fyndet. Varje strypkoppling i filen — varje
         # processanrop, läsning, väntan och nätläsning — måste vara takad eller stå
         # med skäl i STRYP_UNDANTAG. Den som lägger till ett otakat anrop får sviten

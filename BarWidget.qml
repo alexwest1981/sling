@@ -348,6 +348,7 @@ BarWidget {
           borderSpec: Border.controlSpec("normal", root.neonCyan, root.neonCyan)
 
           Text {
+            textFormat: Text.PlainText
             anchors.centerIn: parent
             text: "󰄡"
             color: root.neonMagenta
@@ -361,6 +362,7 @@ BarWidget {
           width: parent.width - Style.space(58)
 
           Text {
+            textFormat: Text.PlainText
             id: wordmark
             text: "SLING"
             color: "#ffffff"
@@ -381,6 +383,7 @@ BarWidget {
           }
 
           Text {
+            textFormat: Text.PlainText
             text: root.str.subtitle
             color: Qt.darker(root.bar.foreground, 1.3)
             font.family: root.bar.fontFamily
@@ -468,6 +471,7 @@ BarWidget {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: !(root.serverRunning && root.qrOk)
             text: root.str.hint_start
             color: Qt.darker(root.bar.foreground, 1.3)
@@ -490,6 +494,7 @@ BarWidget {
               spacing: Style.space(5)
 
               Text {
+                textFormat: Text.PlainText
                 text: "🔗 " + root.serverUrl
                 color: root.bar.foreground
                 font.family: root.bar.fontFamily
@@ -527,6 +532,7 @@ BarWidget {
               spacing: Style.space(5)
 
               Text {
+                textFormat: Text.PlainText
                 text: "🏠 " + root.mdnsUrl
                 color: Qt.darker(root.bar.foreground, 1.2)
                 font.family: root.bar.fontFamily
@@ -583,6 +589,7 @@ BarWidget {
             }
 
             Text {
+              textFormat: Text.PlainText
               id: pctText
               anchors.right: parent.right
               text: root.transfer ? root.transfer.pct + " %" : "—"
@@ -612,6 +619,7 @@ BarWidget {
           }
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             text: root.transfer
                   ? root.transfer.human_done + " / " + root.transfer.human_total + "  ·  "
@@ -658,6 +666,7 @@ BarWidget {
           height: Math.max(sendTitleText.implicitHeight, Style.space(22))
 
           Text {
+            textFormat: Text.PlainText
             id: sendTitleText
             anchors.left: parent.left
             anchors.verticalCenter: parent.verticalCenter
@@ -712,6 +721,7 @@ BarWidget {
               spacing: Style.space(6)
 
               Text {
+                textFormat: Text.PlainText
                 text: "📤"
                 anchors.verticalCenter: parent.verticalCenter
                 font.pixelSize: Style.font.bodySmall
@@ -730,6 +740,7 @@ BarWidget {
               }
 
               Text {
+                textFormat: Text.PlainText
                 text: modelData.size
                 color: Qt.darker(root.bar.foreground, 1.4)
                 font.family: root.bar.fontFamily
@@ -757,6 +768,7 @@ BarWidget {
           visible: root.sendFiles.length > 5
 
           Text {
+            textFormat: Text.PlainText
             anchors.centerIn: parent
             text: "+ " + (root.sendFiles.length - 5) + " " + root.str.more + "…"
             color: root.neonCyan
@@ -780,6 +792,7 @@ BarWidget {
         visible: root.recentFiles.length > 0
 
         Text {
+          textFormat: Text.PlainText
           text: root.str.recent_title
           color: Qt.darker(root.bar.foreground, 1.3)
           font.family: root.bar.fontFamily
@@ -804,6 +817,7 @@ BarWidget {
               spacing: Style.space(8)
 
               Text {
+                textFormat: Text.PlainText
                 text: "📄"
                 anchors.verticalCenter: parent.verticalCenter
                 font.pixelSize: Style.font.bodySmall
@@ -822,6 +836,7 @@ BarWidget {
               }
 
               Text {
+                textFormat: Text.PlainText
                 text: modelData.size
                 color: Qt.darker(root.bar.foreground, 1.4)
                 font.family: root.bar.fontFamily
