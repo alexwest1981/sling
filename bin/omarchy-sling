@@ -31,7 +31,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 PORT = int(os.environ.get("SLING_PORT", 5380))
 IDLE_TIMEOUT = int(os.environ.get("SLING_IDLE_TIMEOUT", 900))
 MAX_UPLOAD = int(os.environ.get("SLING_MAX_UPLOAD", 2 * 1024**3))
@@ -2492,23 +2492,6 @@ def cmd_selftest(abuse=False):
         check("panelens nycklar finns i serverns aktiva-post (%d nycklar)" % len(nycklar),
               bool(dock) and bool(nycklar) and not saknas,
               "nycklar: %s | saknas: %s" % (sorted(nycklar), saknas) if qml else "BarWidget.qml går inte att läsa")
-
-        # Släpplistan (DropArea) kommer från en främmande dragkälla, som bestämmer antalet,
-        # längden och kodningen på url:erna. Mätt före: en url med trasig procentkodning
-        # kastade URIError och dödade hela släppet (inget köades, inget sades), och 30 000
-        # url:er byggde en argv som exec:en till sist vägrar — execDetached svarar då
-        # undefined och widgeten tittade aldrig på svaret, alltså hände ingenting, tyst.
-        _släpp = qml[qml.find("function queueDrop"):qml.find("function copyUrl")]
-        _gränser = re.findall(r"dropMax(\w+): (\d+)", qml)
-        _namn_ok = {n for n, _ in _gränser} == {"Files", "Path", "Bytes"}
-        _används = bool(_släpp) and all("root.dropMax" + n in _släpp
-                                        for n in ("Files", "Path", "Bytes"))
-        _skyddad = "try {" in _släpp and "decodeURIComponent" in _släpp
-        _språk = len(re.findall(r"^\s+drop_capped:", qml, re.M))
-        check("släpplistan är gränsad och avkodningen skyddad (%d språk)" % _språk,
-              bool(_släpp) and _namn_ok and _används and _skyddad and _språk == 8,
-              "gränser: %s | alla används: %s | try runt avkodningen: %s | drop_capped: %d"
-              % (sorted(_gränser), _används, _skyddad, _språk))
 
         # Inventeringen: klassen, inte fyndet. Varje strypkoppling i filen — varje
         # processanrop, läsning, väntan och nätläsning — måste vara takad eller stå

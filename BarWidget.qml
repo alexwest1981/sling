@@ -31,14 +31,6 @@ BarWidget {
   // syntes en nedladdning inte alls medan en uppladdning rullade.
   property var actives: []
   readonly property var extraTransfers: root.actives.length > 1 ? root.actives.slice(1, 4) : []
-  // Ett släpp kommer från en främmande dragkälla, som bestämmer både antalet och längden på
-  // url:erna. Utan gränser hamnar hela listan i argv till CLI:t, och passerar den exec:ens
-  // gräns blir svaret ingenting alls (mätt: 200 001 argument gav execDetached undefined och
-  // widgeten tittade aldrig på svaret). Ett släpp är en mänsklig gest — 100 filer är
-  // generöst, 4096 tecken är PATH_MAX och 512 kB ligger under ARG_MAX.
-  readonly property int dropMaxFiles: 100
-  readonly property int dropMaxPath: 4096
-  readonly property int dropMaxBytes: 524288
   property bool popupOpen: false
   property string qrPath: ""
   property int refreshTrigger: 0
@@ -52,7 +44,6 @@ BarWidget {
       title: "Sling File Sharing",
       subtitle: "Scan with your regular phone camera",
       copied: "Link copied to clipboard!",
-      drop_capped: "%1 not queued (limit per drop)",
       recent_title: "📥 Recently received files:",
       send_title: "📤 Files waiting to be sent",
       remove: "Remove",
@@ -74,7 +65,6 @@ BarWidget {
       title: "Sling Fildelning",
       subtitle: "Scanna med mobilens vanliga kamera",
       copied: "Länk kopierad till urklipp!",
-      drop_capped: "%1 köades inte (gräns per släpp)",
       recent_title: "📥 Senast mottagna filer:",
       send_title: "📤 Filer som väntar att skickas",
       remove: "Ta bort",
@@ -96,7 +86,6 @@ BarWidget {
       title: "Sling Bestandsoverdracht",
       subtitle: "Scan met de camera van je telefoon",
       copied: "Link gekopieerd naar klembord!",
-      drop_capped: "%1 niet in de wachtrij (limiet per sleep)",
       recent_title: "📥 Recent ontvangen bestanden:",
       send_title: "📤 Te verzenden bestanden",
       remove: "Verwijderen",
@@ -118,7 +107,6 @@ BarWidget {
       title: "Sling ファイル共有",
       subtitle: "スマホの標準カメラでスキャン",
       copied: "リンクをクリップボードにコピーしました！",
-      drop_capped: "%1 件は追加されませんでした（1回のドロップの上限）",
       recent_title: "📥 最近受信したファイル:",
       send_title: "📤 送信待ちのファイル",
       remove: "削除",
@@ -140,7 +128,6 @@ BarWidget {
       title: "Sling Dateifreigabe",
       subtitle: "Mit der Handykamera scannen",
       copied: "Link in Zwischenablage kopiert!",
-      drop_capped: "%1 nicht eingereiht (Limit pro Drop)",
       recent_title: "📥 Zuletzt empfangene Dateien:",
       send_title: "📤 Zu sendende Dateien",
       remove: "Entfernen",
@@ -162,7 +149,6 @@ BarWidget {
       title: "Sling Partage de fichiers",
       subtitle: "Scannez avec l'appareil photo du téléphone",
       copied: "Lien copié dans le presse-papiers !",
-      drop_capped: "%1 non mis en file (limite par dépôt)",
       recent_title: "📥 Fichiers récemment reçus :",
       send_title: "📤 Fichiers en attente d'envoi",
       remove: "Supprimer",
@@ -184,7 +170,6 @@ BarWidget {
       title: "Sling Compartir archivos",
       subtitle: "Escanea con la cámara de tu móvil",
       copied: "¡Enlace copiado al portapapeles!",
-      drop_capped: "%1 no encolado(s) (límite por arrastre)",
       recent_title: "📥 Archivos recibidos recientemente:",
       send_title: "📤 Archivos en espera de envío",
       remove: "Eliminar",
@@ -206,7 +191,6 @@ BarWidget {
       title: "Sling 文件传输",
       subtitle: "使用手机相机扫码",
       copied: "链接已复制到剪贴板！",
-      drop_capped: "%1 个文件未加入队列（单次拖放上限）",
       recent_title: "📥 最近接收的文件:",
       send_title: "📤 等待发送的文件",
       remove: "移除",
@@ -288,40 +272,6 @@ BarWidget {
 
   // Kopieringen görs av CLI:t: URL:en (med token) går på stdin till wl-copy, så den
   // syns varken i argv eller hänger på att en QML-process stänger sin pipe (mätt).
-  // Filen som släpps på bar-ikonen går rakt in i skicka-kön — samma väg som
-  // "Skicka fil…", men utan fönsterval. drop.urls är file://-URL:er.
-  function queueDrop(urls) {
-    var paths = []
-    var byte = 0
-    var hoppade = 0
-    for (var i = 0; i < urls.length; i++) {
-      if (paths.length >= root.dropMaxFiles) {
-        hoppade += urls.length - i
-        break
-      }
-      var u = String(urls[i])
-      if (u.indexOf("file://") !== 0) continue
-      var p
-      try {
-        p = decodeURIComponent(u.slice(7))
-      } catch (e) {
-        hoppade++                  // trasig procentkodning: hoppa raden, inte hela släppet
-        continue
-      }
-      if (p.length > root.dropMaxPath || byte + p.length > root.dropMaxBytes) {
-        hoppade++
-        continue
-      }
-      byte += p.length
-      paths.push(p)
-    }
-    if (paths.length === 0) return
-    root.runSling.apply(null, ["send"].concat(paths))
-    root.popupOpen = true          // kvitto: kön syns direkt i panelen
-    if (hoppade > 0 && root.bar)   // tyst bortfall är felet, inte bortfallet
-      root.bar.showTooltip(root, String(root.str.drop_capped).replace("%1", hoppade))
-  }
-
   function copyUrl(which) {
     root.runSling("copy", which)
     if (root.bar) root.bar.showTooltip(root, root.str.copied)
@@ -354,14 +304,6 @@ BarWidget {
         runSling("start")
       }
       root.popupOpen = !root.popupOpen
-    }
-
-    DropArea {
-      anchors.fill: parent
-      onDropped: function(drop) {
-        root.queueDrop(drop.urls)
-        drop.accept()
-      }
     }
   }
 
