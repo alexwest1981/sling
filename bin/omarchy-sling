@@ -12,6 +12,7 @@
 import ast
 import html
 import http.client
+import io
 import json
 import os
 import re
@@ -42,6 +43,19 @@ CLIP_MAX = int(os.environ.get("SLING_CLIP_MAX", 64 * 1024))
 # stänga får inte hänga "Send clipboard to phone".
 CLIP_TIMEOUT = float(os.environ.get("SLING_CLIP_TIMEOUT", "5"))
 SOCKET_TIMEOUT = int(os.environ.get("SLING_SOCKET_TIMEOUT", 30))
+# Absolut frist per förfrågan, i två faser: rad + huvuden inom REQUEST_DEADLINE från
+# första byten (oautentiserat — vem som helst på LAN:et kan öppna en anslutning och
+# droppa en byte innanför per-läsnings-timeouten, och med MAX_CONNECTIONS platser
+# räcker 32 sådana för att telefonen ska få 503), och kroppen inom
+# max(BODY_MIN, storlek / BODY_RATE) när handläggaren känner sin storlek. Kroppsfristen
+# rör bara den som redan har token; den finns för att en stor fil på ett uselt Wi-Fi
+# ska gå igenom medan en som droppar en byte per halvminut inte ska. Kalibreringen bor
+# i de tre variablerna — en länk är inte ett ideal. (Mätt 2026-10: en uppladdning som
+# droppade strax innanför per-läsnings-timeouten höll en av 32 platser utan att någonsin
+# bli klar.)
+REQUEST_DEADLINE = float(os.environ.get("SLING_REQUEST_DEADLINE", "10"))
+BODY_MIN = float(os.environ.get("SLING_BODY_MIN", "30"))
+BODY_RATE = float(os.environ.get("SLING_BODY_RATE", "65536"))
 # Tak för CLI:ts läsning av serverns eget /status. Panelen pollar den vägen, och en
 # granne på samma konto kan binda porten före oss och svara själv: utan tak buffras
 # ett ändlöst svar tills minnet tar slut, och urllibs timeout (per läsning) gör ingen
@@ -913,6 +927,59 @@ PAGE = """<!DOCTYPE html>
 </html>"""
 
 
+class DeadlineReader(io.RawIOBase):
+    """Anslutningens läsningar, med EN absolut frist per förfrågan.
+
+    `settimeout` (och därmed `SOCKET_TIMEOUT`) gäller per läsning, så en motpart som
+    droppar en byte strax innanför den håller kvar anslutningen hur länge som helst —
+    utan token, och med `SLING_MAX_CONNECTIONS` platser räcker 32 sådana för att
+    telefonen ska få 503. Samma klass som klientens `/status` (HANCORE, ärende 10821):
+    en tidsgräns per läsning är ingen tidsgräns för samtalet. Två faser:
+
+      väntar     ingen förfrågan har börjat: per-läsnings-timeouten som förut, så en
+                 ledig keep-alive-anslutning inte dör medan telefonen tänker.
+      förfrågan  första byten har kommit: rad och huvuden ska vara klara inom
+                 `SLING_REQUEST_DEADLINE`; kroppen får sin egen frist när handläggaren
+                 känner sin storlek (`arm_kropp`).
+
+    Fristen är absolut — den räknas om, den förlängs inte av trafik — annars vore den
+    samma fälla som per-läsnings-timeouten. Läsningarna går genom den här i stället för
+    genom `self.connection.makefile()`, för det är enda stället där varje enskild
+    läsning i `http.server`s tolkning (rad, huvuden, multipart) passerar.
+    """
+
+    def __init__(self, sock):
+        self._sock = sock
+        self._fas = "väntar"
+        self._slut = 0.0
+
+    def ny_förfrågan(self):
+        """Ny förfrågan på samma anslutning: fristen börjar om."""
+        self._fas = "väntar"
+
+    def arm_kropp(self, storlek):
+        """Kroppen på en redan läst förfrågan: egen frist, aldrig kortare än radens."""
+        self._fas = "kropp"
+        self._slut = max(self._slut, time.monotonic() + max(BODY_MIN, storlek / max(BODY_RATE, 1.0)))
+
+    def readable(self):
+        return True
+
+    def readinto(self, b):
+        if self._fas == "väntar":
+            self._sock.settimeout(SOCKET_TIMEOUT)
+        else:
+            kvar = self._slut - time.monotonic()
+            if kvar <= 0:
+                raise TimeoutError("fristen för förfrågan är slut")
+            self._sock.settimeout(kvar)
+        fått = self._sock.recv_into(b)
+        if fått and self._fas == "väntar":
+            self._fas = "förfrågan"            # rad och huvuden mäts härifrån
+            self._slut = time.monotonic() + REQUEST_DEADLINE
+        return fått
+
+
 class SlingHandler(BaseHTTPRequestHandler):
     server_version = "Sling/" + VERSION
     protocol_version = "HTTP/1.1"
@@ -930,16 +997,26 @@ class SlingHandler(BaseHTTPRequestHandler):
         en fast gräns gör det inte.
 
         Tidsgränsen per anslutning: den som ansluter och sedan tiger ska inte
-        hålla en tråd och en fildeskriptor. Gränsen gäller varje läsning och
-        skrivning, inte hela överföringen — en långsam men levande telefon
-        klarar sig, och en död anslutning kastas av handle_one_request.
+        hålla en tråd och en fildeskriptor. Skrivningar har gränsen per skrivning,
+        och en död anslutning kastas av handle_one_request. Läsningarna går genom
+        `DeadlineReader` i stället: en absolut frist per FÖRFRÅGAN, för en gräns per
+        läsning håller inte mot en motpart som droppar en byte strax innanför den
+        (se klassen — samma klass av fynd som HANCORE filade på klientsidan).
         """
         super().setup()
+        self.rfile = io.BufferedReader(
+            DeadlineReader(self.connection),
+            self.rbufsize if self.rbufsize and self.rbufsize > 0 else io.DEFAULT_BUFFER_SIZE)
         try:
             self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self.connection.settimeout(SOCKET_TIMEOUT)
         except OSError:
             pass
+
+    def handle_one_request(self):
+        """Ny frist för varje förfrågan på anslutningen (keep-alive börjar om)."""
+        self.rfile.raw.ny_förfrågan()
+        super().handle_one_request()
 
     def log_message(self, fmt, *args):
         pass
@@ -954,6 +1031,13 @@ class SlingHandler(BaseHTTPRequestHandler):
         return None
 
     def _send(self, code, body=b"", ctype="text/plain; charset=utf-8", extra=None):
+        # Skrivningen ärver inte läsningens krympande frist: en svarsskrivning ska ha
+        # sin egen gräns per skrivning, annars kunde ett sent svar dö på ett tak som
+        # redan var nästan slut.
+        try:
+            self.connection.settimeout(SOCKET_TIMEOUT)
+        except OSError:
+            pass
         self.send_response(code)
         if body:
             self.send_header("Content-Type", ctype)
@@ -1056,6 +1140,9 @@ class SlingHandler(BaseHTTPRequestHandler):
         if length <= 0:
             self._send(400, json.dumps({"ok": False, "error": "empty"}).encode(), "application/json")
             return
+        # Kroppens frist (se DeadlineReader). Över taket läses bara den del som ändå ska
+        # slängas, så en lögnaktig Content-Length inte ger timmar åt en som droppar.
+        self.rfile.raw.arm_kropp(8 * 1024 * 1024 if length > CLIP_MAX else length)
         if length > CLIP_MAX:
             # Läs och släng kroppen innan svaret, samma skäl som för uppladdningen.
             self.close_connection = True
@@ -1108,6 +1195,9 @@ class SlingHandler(BaseHTTPRequestHandler):
         if not ctype.startswith("multipart/form-data") or length == 0:
             self._send(400)
             return
+        # Kroppens frist (se DeadlineReader). Över taket läses bara den del som ändå ska
+        # slängas, så en lögnaktig Content-Length inte ger timmar åt en som droppar.
+        self.rfile.raw.arm_kropp(8 * 1024 * 1024 if length > MAX_UPLOAD else length)
         if length > MAX_UPLOAD:
             log("avvisade uppladdning på %d byte (tak %d)" % (length, MAX_UPLOAD))
             # Läs och släng kroppen (upp till 8 MB) INNAN svaret skickas: annars
@@ -1324,7 +1414,15 @@ def server_status(token, deadline=STATUS_DEADLINE, tak=STATUS_MAX):
         if r.status != 200:               # fel token, eller någon annans svar
             return None
         kropp = läs_takad(r, tak=tak, deadline=deadline)
-        return json.loads(kropp) if kropp is not None else None
+        if kropp is None:
+            return None
+        svar = json.loads(kropp)
+        # Bara vår egen server svarar med den formen. En granne som håller porten får vår
+        # token i förfrågan (den ligger i sökvägen) och kan svara 200 med vilket JSON som
+        # helst; ett svar som inte är vårt objekt får inte läsas som serverns tillstånd —
+        # panelen visar det som "adressen att minnas", och `stop`s fallback går på samma
+        # svar. (Mätt: `stop` nöjde sig förut med vilket 200-svar som helst.)
+        return svar if isinstance(svar, dict) and svar.get("ok") is True else None
     except Exception:                     # noqa: BLE001 — inget svar räknas som inget svar
         return None
     finally:
@@ -1669,54 +1767,61 @@ def cmd_send_pick():
 # att granska i sig, eftersom varje post måste ha ett skäl och en funktion som
 # faktiskt finns kvar.
 STRYP_UNDANTAG = (
-    # Processer som med flit lever längre än anropet, eller är platsen som sätter taket
-    ("bounded_run", "platsen som sätter taket: Popen + wait(timeout) + gruppkill"),
-    ("cmd_start", "serverns egen demon — ska leva längre än anropet"),
-    ("start_mdns", "avahi-publish-service — publicerar tills servern stängs"),
-    ("cmd_send_pick", "zenity blockerar med flit tills användaren valt en fil"),
+    # (funktion, familj, antal, skäl) — antalet är hur många kopplingar i den familjen
+    # funktionen hade när undantaget skrevs. Ändras antalet (någon lägger in ännu en
+    # läsning i samma funktion) stämmer ingen post och sviten blir röd.
+    ("bounded_run", "processer", 1, "platsen som sätter taket: Popen + wait(timeout) + gruppkill"),
+    ("cmd_start", "processer", 1, "serverns egen demon — ska leva längre än anropet"),
+    ("start_mdns", "processer", 1, "avahi-publish-service — publicerar tills servern stängs"),
+    ("cmd_send_pick", "processer", 1, "zenity blockerar med flit tills användaren valt en fil"),
     # Läsningar av våra egna filer: 0700-katalogen, skrivna av oss, eller en
     # process egen kommandorad (kärnan takar argv)
-    ("read_token", "vår egen nyckelfil i en 0700-katalog"),
-    ("filmnehall", "vår egen nyckelfil i en 0700-katalog"),
-    ("generate_qr", "vår egen nyckelfil (URL:en) i en 0700-katalog"),
-    ("cmd_stop", "vår egen pidfil i en 0700-katalog"),
-    ("read_clip", "vårt eget urklippsslot, skrivet av oss med tak (CLIP_MAX)"),
-    ("pid_is_our_server", "en process egen kommandorad ur /proc"),
-    ("stale_publishers", "en process egen kommandorad ur /proc"),
-    ("granska_sankor", "läser sin egen källfil — den är vår, och den här raden är hela poängen"),
-    # Provhalvan läser sin egen scratch och svitens egen server
-    ("cmd_selftest", "prov som läser sin egen scratch och svitens egen server"),
-    ("cmd_abuse", "samma som cmd_selftest, för den otillförlitliga ytan"),
+    ("read_token", "läsningar", 1, "vår egen nyckelfil i en 0700-katalog"),
+    ("filmnehall", "läsningar", 1, "vår egen nyckelfil i en 0700-katalog"),
+    ("generate_qr", "läsningar", 1, "vår egen nyckelfil (URL:en) i en 0700-katalog"),
+    ("cmd_stop", "läsningar", 1, "vår egen pidfil i en 0700-katalog"),
+    ("read_clip", "läsningar", 1, "vårt eget urklippsslot, skrivet av oss med tak (CLIP_MAX)"),
+    ("pid_is_our_server", "läsningar", 1, "en process egen kommandorad ur /proc"),
+    ("stale_publishers", "läsningar", 1, "en process egen kommandorad ur /proc"),
+    ("granska_sankor", "läsningar", 1, "läser sin egen källfil — den är vår, och den här raden är hela poängen"),
+    ("get_local_ip", "nät", 1, "UDP-anslutning utan trafik — väljer bara rutt, läser inget, kan inte hänga"),
+    ("port_open", "nät", 1, "connect_ex med 0,3 s tak och ingen läsning — svarar bara ja/nej"),
+    ("server_status", "nät", 1, "DeadlineSocket: EN absolut deadline över hela transaktionen, plus STATUS_MAX byte kropp"),
 )
-# Nätläsningarna har sin egen tabell: ett undantag där får INTE samtidigt ursäkta en
-# otakad filläsning i samma funktion. (Mätt på en röd kopia: med ett gemensamt
-# undantag gick `r.read()` i server_status fri, eftersom funktionen redan stod i
-# tabellen för sin urlopen — precis den klass inventeringen finns för att fånga.)
-STRYP_NÄT_UNDANTAG = (
-    ("server_status", "DeadlineSocket: EN absolut deadline över hela transaktionen, plus STATUS_MAX byte kropp"),
-    ("get_local_ip", "UDP-anslutning utan trafik — väljer bara rutt, läser inget, kan inte hänga"),
-    ("port_open", "connect_ex med 0,3 s tak och ingen läsning — svarar bara ja/nej"),
-    ("cmd_selftest", "prov mot svitens egen server i scratch"),
-    ("cmd_abuse", "samma som cmd_selftest, för den otillförlitliga ytan"),
-)
+# Svitens egen kod körs bara när användaren ber om den och ligger inte på någon
+# förfrågningsväg — det skälet är strukturellt, inte påskrivet, och därför behöver den
+# halvan inga pinnade undantag. (Skälet till att de pinnas i stället för att skrivas
+# fritt: en ursäkt som gäller en hel funktion intygar sig själv.)
+STRYP_PROVHALVA = ("cmd_selftest", "cmd_abuse")
+FAMILJER = ("processer", "läsningar", "väntningar", "nät")
+# En läsning med en literalsiffra över det här är ingen takning, bara en stor buffert.
+LÄSNINGS_TAK = 8 * 1024 * 1024
 
 
-def _undantagen(namn, tabell=None):
-    """Skälet för ett namngivet undantag, eller '' om funktionen inte står där."""
-    for n, skal in (STRYP_UNDANTAG if tabell is None else tabell):
-        if n == namn:
+def _undantagen(namn, familj, antal):
+    """Skälet för ett pinnat undantag, eller '' om ingen post stämmer exakt.
+
+    Pinnen är (funktion, familj, antal anrop): en post för `read_clip` med `läsningar`
+    och antal 1 slutar gälla i samma stund funktionen får en läsning till.
+    """
+    for n, f, a, skal in STRYP_UNDANTAG:
+        if n == namn and f == familj and a == antal:
             return skal
     return ""
 
 
-def granska_sankor(källa=None, rapportera=False):
+def granska_sankor(källa=None, rapportera=False, text=None):
     """Inventerar varje strypkoppling i den här filen (se kommentaren ovan).
 
     Ger (namn, ok, detalj) per familj till sviten — eller hela listan som text, för
-    att kunna lägga till ett undantag med skäl i stället för att gissa.
+    att kunna lägga till ett undantag med skäl i stället för att gissa. `text` gör att
+    sviten kan köra samma granskning mot en påhittad källtext, och därmed visa att
+    reglerna biter (ett prov som bara ser grönt ut på den egna filen bevisar inget).
     """
-    with open(källa or os.path.abspath(__file__), encoding="utf-8") as fh:
-        träd = ast.parse(fh.read())
+    if text is None:
+        with open(källa or os.path.abspath(__file__), encoding="utf-8") as fh:
+            text = fh.read()
+    träd = ast.parse(text)
     förälder = {}
     for nod in ast.walk(träd):
         for barn in ast.iter_child_nodes(nod):
@@ -1742,7 +1847,12 @@ def granska_sankor(källa=None, rapportera=False):
         if namn.startswith("subprocess.") and namn.split(".")[1] in (
                 "run", "Popen", "call", "check_output", "check_call"):
             return "processer"
-        if sista in ("read", "read1", "readline", "readlines", "recv", "recvfrom", "load", "loads"):
+        # Allt som läser ur en ström. Namnen är de man faktiskt skriver; en form som
+        # inte står här är en form grinden inte ser (t.ex. itererar över ett filobjekt
+        # — det fångas i stället av loopregeln nedan, eftersom det inte är ett anrop).
+        if sista in ("read", "read1", "readline", "readlines", "readinto", "readinto1",
+                     "recv", "recv_into", "recvfrom", "recvmsg", "recvfrom_into",
+                     "sendfile", "copyfileobj", "load", "loads"):
             return "läsningar"
         if sista in ("wait", "communicate"):
             return "väntningar"
@@ -1753,9 +1863,38 @@ def granska_sankor(källa=None, rapportera=False):
 
     funktioner = {n.name for n in ast.walk(träd)
                   if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
-    funna = {f: [] for f in ("processer", "läsningar", "väntningar", "nät")}
-    antal = dict.fromkeys(funna, 0)
-    begagnade = set()
+
+    def takad_av_form(nod, f):
+        """Är anropet takat av sin egen form (storlek, timeout)? """
+        if f == "processer":
+            return any(k.arg == "timeout" for k in nod.keywords)
+        if f == "nät":
+            # En förbindelse är aldrig takad av sin form: om hela transaktionen är
+            # takad syns det inte på anropet (taket kan bo i en klass, som DeadlineSocket)
+            # — därför kräver varje nätkoppling ett pinnat undantag med skäl.
+            return False
+        if f == "läsningar":
+            # read(65536), inte read() — och en literalsiffra över LÄSNINGS_TAK är en
+            # stor buffert, inte ett tak.
+            if len(nod.args) == 1 and isinstance(nod.args[0], ast.Constant):
+                return not isinstance(nod.args[0].value, int) or nod.args[0].value <= LÄSNINGS_TAK
+            return bool(nod.args)
+        return bool(nod.args) or any(k.arg == "timeout" for k in nod.keywords)
+
+    def öppnade_namn(fn_nod):
+        """Namn som en open() bundits till i den här funktionen."""
+        namn = set()
+        for n in ast.walk(fn_nod):
+            if (isinstance(n, ast.withitem) and isinstance(n.context_expr, ast.Call)
+                    and kort(n.context_expr.func, 20) == "open"
+                    and isinstance(n.optional_vars, ast.Name)):
+                namn.add(n.optional_vars.id)
+            elif (isinstance(n, ast.Assign) and isinstance(n.value, ast.Call)
+                    and kort(n.value.func, 20) == "open"):
+                namn |= {m.id for m in n.targets if isinstance(m, ast.Name)}
+        return namn
+
+    träffar = []                       # (funktion, familj, rad, text, takad)
     for nod in ast.walk(träd):
         if not isinstance(nod, ast.Call):
             continue
@@ -1763,40 +1902,59 @@ def granska_sankor(källa=None, rapportera=False):
         f = familj(namn)
         if not f:
             continue
+        träffar.append((omsluter(nod), f, nod.lineno, kort(nod), takad_av_form(nod, f)))
+    # En loop över ett öppnat filobjekt (`for rad in fh:`) är en obegränsad läsning som
+    # inte är ett anrop — den syntes inte alls i den första versionen av den här regeln.
+    for fn_nod in ast.walk(träd):
+        if not isinstance(fn_nod, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        namn = öppnade_namn(fn_nod)
+        if not namn:
+            continue
+        for n in ast.walk(fn_nod):
+            if isinstance(n, ast.For) and isinstance(n.iter, ast.Name) and n.iter.id in namn:
+                träffar.append((omsluter(n), "läsningar", n.lineno, kort(n), False))
+
+    antal = dict.fromkeys(FAMILJER, 0)
+    funna = {f: [] for f in FAMILJER}
+    per_funktion = {}
+    for fn, f, rad, text, takad in träffar:
         antal[f] += 1
-        fn = omsluter(nod)
-        if f == "nät":
-            takad = bool(_undantagen(fn, STRYP_NÄT_UNDANTAG))
-        elif f == "processer":
-            takad = any(k.arg == "timeout" for k in nod.keywords)
-        elif f == "läsningar":
-            takad = bool(nod.args)       # read(65536), inte read()
-        else:
-            takad = bool(nod.args) or any(k.arg == "timeout" for k in nod.keywords)
-        if takad:
-            begagnade.add(fn)
-        elif _undantagen(fn):
-            begagnade.add(fn)            # taket är namngivet: skälet står i tabellen
-        else:
-            funna[f].append("rad %d i %s: %s" % (nod.lineno, fn or "<modul>", kort(nod)))
+        per_funktion.setdefault((fn, f), []).append((rad, text, takad))
+
+    begagnade = set()
+    for (fn, f), poster in per_funktion.items():
+        if fn in STRYP_PROVHALVA:            # svitens egen kod (se kommentaren)
+            begagnade.add((fn, f))
+            continue
+        otakade = [p for p in poster if not p[2]]
+        if not otakade:
+            continue
+        if _undantagen(fn, f, len(poster)):  # pinnat: funktion, familj OCH antal
+            begagnade.add((fn, f))
+            continue
+        funna[f] += ["rad %d i %s (%s, %d anrop): %s"
+                     % (rad, fn or "<modul>", f, len(poster), text)
+                     for rad, text, _ in otakade]
+    pinnade = {(n, f) for n, f, _, _ in STRYP_UNDANTAG}
+    kvar = sorted("%s/%s" % (n, f) for n, f in pinnade
+                  if n not in funktioner or (n, f) not in begagnade)
     if rapportera:
         rader = []
-        for f in ("processer", "läsningar", "väntningar", "nät"):
+        for f in FAMILJER:
             rader.append("%-11s %d anrop" % (f, antal[f]))
             rader += ["    otakad: " + x for x in funna[f]]
-        rader.append("undantag som inte längre begagnas: %s"
-                     % (sorted({n for n, _ in STRYP_UNDANTAG + STRYP_NÄT_UNDANTAG} - begagnade) or "inga"))
+        rader.append("undantag som inte längre stämmer: %s" % (", ".join(kvar) or "inga"))
         return "\n".join(rader)
     ut = []
-    for f in ("processer", "läsningar", "väntningar", "nät"):
+    for f in FAMILJER:
         ut.append(("inventeringen: %s takade" % f, not funna[f],
                    "%d anrop, %d otakade%s" % (antal[f], len(funna[f]),
                                                ": " + "; ".join(funna[f][:3]) if funna[f] else "")))
-    kvar = sorted(n for n, _ in STRYP_UNDANTAG + STRYP_NÄT_UNDANTAG
-                  if n not in funktioner or n not in begagnade)
-    ut.append(("inventeringen: varje namngivet undantag begagnas", not kvar,
+    ut.append(("inventeringen: varje pinnat undantag stämmer", not kvar,
                ", ".join(kvar) if kvar
-               else "%d undantag, alla med skäl" % (len(STRYP_UNDANTAG) + len(STRYP_NÄT_UNDANTAG))))
+               else "%d undantag, var och ett pinnat på funktion, familj och antal"
+                    % len(STRYP_UNDANTAG)))
     return ut
 
 
@@ -1843,6 +2001,11 @@ def cmd_selftest(abuse=False):
                SLING_MAX_UPLOAD="2097152",            # 2 MB i provet
                SLING_MAX_CONNECTIONS="16",            # taket prövas nedan (12 samtidiga i kapplöpningsprovet)
                SLING_SOCKET_TIMEOUT="3",
+               # Förfrågans och kroppens frister: korta i provet så att de går att mäta
+               # (se DeadlineReader och proven nedanför takprovet).
+               SLING_REQUEST_DEADLINE="2",
+               SLING_BODY_MIN="2",
+               SLING_BODY_RATE="8192",
                SLING_CLIP_TIMEOUT="1.5",              # provet för en hängande wl-copy
                XDG_RUNTIME_DIR=tmp,
                XDG_STATE_HOME=tmp,
@@ -1928,6 +2091,40 @@ def cmd_selftest(abuse=False):
                    '    fd = os.open(path, os.O_WRONLY | os.O_CREAT)\n')
         check("grindarna biter på de gamla formerna", len(source_shape_hits(_gammal)) == 2,
               str(source_shape_hits(_gammal)))
+
+        # Inventeringen prövas mot påhittade källtexter, inte bara mot den här filen:
+        # en regel som alltid ser grön ut på sin egen fil bevisar ingenting. (HANCORE om
+        # inventeringen: en ursäkt som gäller en hel funktion intygar sig själv.)
+        def _familje_ok(kod, familj):
+            for _n, _ok, _d in granska_sankor(text=kod):
+                if _n == "inventeringen: %s takade" % familj:
+                    return _ok
+            return None
+
+        check("en läsning utan tak blir röd",
+              _familje_ok('def f():\n    with open("x") as fh:\n        return fh.read()\n',
+                          "läsningar") is False)
+        check("en literalsiffra över taket är inget tak",
+              _familje_ok('def f():\n    with open("x") as fh:\n        return fh.read(20000000)\n',
+                          "läsningar") is False)
+        check("en loop över ett öppnat filobjekt blir röd",
+              _familje_ok('def f():\n    with open("x") as fh:\n        for rad in fh:\n            pass\n',
+                          "läsningar") is False)
+        check("en förbindelse kräver sitt pinnade skäl",
+              _familje_ok('def f():\n    s = socket.create_connection(("127.0.0.1", 1), timeout=1)\n'
+                          '    return s\n', "nät") is False)
+        # ... och pinnen själv: samma funktion med samma antal är grön, en till är röd.
+        _pin = ('def read_clip():\n'
+                '    with open("x") as fh:\n'
+                '        return fh.read()\n')
+        _pin_extra = ('def read_clip():\n'
+                      '    with open("x") as fh:\n'
+                      '        a = fh.read()\n'
+                      '        return fh.read() + a\n')
+        check("premissen: en pinnad funktion med ett anrop är grön",
+              _familje_ok(_pin, "läsningar") is True)
+        check("en extra otakad läsning i en pinnad funktion blir röd",
+              _familje_ok(_pin_extra, "läsningar") is False)
 
         # Inventeringen: klassen, inte fyndet. Varje strypkoppling i filen — varje
         # processanrop, läsning, väntan och nätläsning — måste vara takad eller stå
@@ -2235,6 +2432,79 @@ def cmd_selftest(abuse=False):
             quiet.close()
         took = time.monotonic() - t0
         check("tyst klient släpps av läsdeadlinen", released and took < deadline + 4, "%.1f s" % took)
+
+        # HANCORE:s femte fynd var samma klass ett lager in (en gräns per läsning är ingen
+        # gräns för samtalet) — och servern hade den kvar: en motpart utan token kunde
+        # droppa en byte strax innanför SOCKET_TIMEOUT och hålla en av takets platser hur
+        # länge som helst. Nu är rad + huvuden (SLING_REQUEST_DEADLINE) och kroppen
+        # (max(SLING_BODY_MIN, storlek / SLING_BODY_RATE)) varsin ABSOLUT frist.
+        frist = float(env["SLING_REQUEST_DEADLINE"])
+
+        t0 = time.monotonic()
+        dropp = socket.create_connection(("127.0.0.1", port), timeout=frist + 6)
+        släppt = False
+        try:
+            for _ in range(int((frist + 4) / 0.2)):
+                time.sleep(0.2)
+                dropp.sendall(b"G")              # droppar — en radbrytning kommer aldrig
+        except OSError:
+            släppt = True                        # servern stängde mitt i: det är svaret
+        finally:
+            dropp.close()
+        tog = time.monotonic() - t0
+        check("en droppande förfrågningsrad släpps av fristen", släppt and tog < frist + 4,
+              "%.1f s (frist %.1f s)" % (tog, frist))
+
+        # Kroppens frist: en uppladdning som droppar sin kropp håller inte platsen, och
+        # den halva filen kastas (samma regel som för en avbruten anslutning).
+        _kropp, _ctype = multipart([("halv.bin", b"k" * 4000)])
+        kropp_frist = max(float(env["SLING_BODY_MIN"]), len(_kropp) / float(env["SLING_BODY_RATE"]))
+        t0 = time.monotonic()
+        långsam = socket.create_connection(("127.0.0.1", port), timeout=kropp_frist + 6)
+        släppt = False
+        try:
+            långsam.sendall(("POST /t/%s/upload HTTP/1.1\r\nHost: x\r\n"
+                             "Content-Type: %s\r\n"
+                             "Content-Length: %d\r\n\r\n" % (token, _ctype, len(_kropp))).encode()
+                            + _kropp[:200])       # förbi gränsen: filen hinner skapas
+            for _ in range(int((kropp_frist + 4) / 0.2)):
+                time.sleep(0.2)
+                långsam.sendall(b"k")
+        except OSError:
+            släppt = True
+        finally:
+            långsam.close()
+        tog = time.monotonic() - t0
+        check("en droppande kropp släpps av kroppsfristen", släppt and tog < kropp_frist + 4,
+              "%.1f s (frist %.1f s)" % (tog, kropp_frist))
+        check("  ... och den halva filen kastas",
+              not os.path.exists(os.path.join(tmp, "Received", "halv.bin")), "halv.bin ligger kvar")
+
+        # Vakt, inte bevis: fristen börjar när FÖRFRÅGAN börjar, inte när anslutningen
+        # öppnas. En ledig keep-alive-anslutning får inte dö medan telefonen tänker —
+        # annars hade fixen bytt en hängning mot ett trasigt andra klick i mobilen.
+        tålamod = socket.create_connection(("127.0.0.1", port), timeout=frist + 10)
+        svar2 = b""
+        try:
+            tålamod.sendall(("GET /t/%s/status HTTP/1.1\r\nHost: x\r\n\r\n" % token).encode())
+            första = tålamod.recv(15)
+            time.sleep(frist + 1)                     # längre än fristen, mitt i ingenting
+            tålamod.sendall(("GET /t/%s/status HTTP/1.1\r\nHost: x\r\n\r\n" % token).encode())
+            tålamod.settimeout(frist + 2)
+            while True:
+                bit = tålamod.recv(4096)
+                if not bit:
+                    break
+                svar2 += bit
+                if svar2.count(b"HTTP/1.1 200") >= 1:
+                    break
+        except OSError:
+            pass
+        finally:
+            tålamod.close()
+        check("en ledig keep-alive-anslutning dör inte av fristen",
+              första.startswith(b"HTTP/1.1 200") and svar2.count(b"HTTP/1.1 200") >= 1,
+              "%r / %r" % (första[:12], svar2[:24]))
 
         # Urklipp: PC → telefon via sloten (skriven av CLI:t), telefon → PC via
         # wl-copy på stdin. Innehållet får aldrig hamna i argv — ett urklipp kan
@@ -3017,6 +3287,13 @@ def cmd_selftest(abuse=False):
                     if beteende == "statusrad":
                         droppa(klient, b"H")         # statusraden tar aldrig slut
                         continue
+                    if beteende == "skräp":
+                        # Ett 200-svar med giltig JSON som INTE är vårt objekt: den som
+                        # håller porten får vår token i förfrågan och kan svara vad som
+                        # helst. Formen får inte läsas som serverns eget tillstånd.
+                        klient.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                                       b"Content-Length: 1\r\n\r\n5")
+                        continue
                     klient.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n")
                     if beteende == "huvud":
                         droppa(klient, b"X")         # ett huvud tar aldrig slut
@@ -3048,7 +3325,8 @@ def cmd_selftest(abuse=False):
                                          ("en droppande statusrad", "statusrad", port + 17),
                                          ("ett droppande huvud", "huvud", port + 18),
                                          ("ett droppande chunk-huvud", "chunk", port + 19),
-                                         ("en droppande trailer", "trailer", port + 20)):
+                                         ("en droppande trailer", "trailer", port + 20),
+                                         ("ett främmande 200-svar i rätt form", "skräp", port + 21)):
         sq, sq_stopp = starta_squatter(egen_port, beteende)
         läskod = ("import importlib.machinery as m, importlib.util as u, resource, sys, os, time\n"
                   "os.environ['XDG_RUNTIME_DIR'] = %r\n"
