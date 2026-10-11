@@ -13,6 +13,7 @@ import ast
 import html
 import http.client
 import io
+import itertools
 import json
 import os
 import re
@@ -56,6 +57,10 @@ SOCKET_TIMEOUT = int(os.environ.get("SLING_SOCKET_TIMEOUT", 30))
 REQUEST_DEADLINE = float(os.environ.get("SLING_REQUEST_DEADLINE", "10"))
 BODY_MIN = float(os.environ.get("SLING_BODY_MIN", "30"))
 BODY_RATE = float(os.environ.get("SLING_BODY_RATE", "65536"))
+# Svarens frist (samma form som kroppens, med egna siffror: up och ner är inte samma
+# länk, och proven drar ner den ena utan att röra den andra).
+RESPONSE_MIN = float(os.environ.get("SLING_RESPONSE_MIN", "30"))
+RESPONSE_RATE = float(os.environ.get("SLING_RESPONSE_RATE", "65536"))
 # Tak för CLI:ts läsning av serverns eget /status. Panelen pollar den vägen, och en
 # granne på samma konto kan binda porten före oss och svara själv: utan tak buffras
 # ett ändlöst svar tills minnet tar slut, och urllibs timeout (per läsning) gör ingen
@@ -137,18 +142,37 @@ _TOKEN = ""
 # Sätts i cmd_server: den processen ÄR servern och får inte hämta sin egen status.
 IS_SERVER = False
 
-# Pågående överföring — panelen ritar en förloppsindikator av den här posten.
-# ponytail: en global post, sista skrivaren vinner. Räcker för en telefon i taget;
-# en dict per anslutning om flera samtidiga överföringar ska visas var för sig.
-ACTIVE = {"dir": "", "name": "", "done": 0, "total": 0, "t0": 0.0}
+# Pågående överföringar — panelen ritar en förloppsindikator av den senaste.
+#
+# Förut fanns EN global burk och sista skrivaren vann: två samtidiga överföringar
+# (webbläsaren skickar två filer i samma POST, eller en nedladdning medan en
+# uppladdning rullar) skrev över varandra, så namn, total och procent kunde komma
+# från olika filer och den ena syntes inte alls (mätt: name från den andra, total
+# dess, den första borta). Nu har varje överföring sin egen burk och ett eget
+# handtag; panelen visar den senast startade som lever.
+# ponytail: fortfarande en rad i docken. Ska flera visas samtidigt är nästa steg en
+# lista i QML:en, inte fler burkar här.
+_TRÄFF = itertools.count(1)
+_AKTIVA = {}
+_AKTIV_LÅS = threading.Lock()
 
 
 def start_transfer(direction, name, total):
-    ACTIVE.update({"dir": direction, "name": name, "done": 0, "total": total, "t0": time.monotonic()})
+    """Startar en överföring och lämnar handtaget bitarna räknas på."""
+    with _AKTIV_LÅS:
+        träff = next(_TRÄFF)
+        _AKTIVA[träff] = {"dir": direction, "name": name, "done": 0, "total": total,
+                          "t0": time.monotonic()}
+    return träff
 
 
-def bump_transfer(nbytes):
-    ACTIVE["done"] += nbytes
+def bump_transfer(träff, nbytes, namn=None):
+    with _AKTIV_LÅS:
+        burk = _AKTIVA.get(träff)
+        if burk is not None:
+            burk["done"] += nbytes
+            if namn:
+                burk["name"] = namn
     # En pågående överföring är trafik. Avväpningstimern räknade bara förfrågningar,
     # så en överföring som tog längre tid än SLING_IDLE_TIMEOUT kapades mitt i —
     # mätt med taket satt till 2 s: BrokenPipe efter 3,6 s och ingen fil på disk.
@@ -158,22 +182,26 @@ def bump_transfer(nbytes):
     LAST_ACTIVITY["t"] = time.monotonic()
 
 
-def end_transfer():
-    ACTIVE.update({"dir": "", "name": "", "done": 0, "total": 0, "t0": 0.0})
+def end_transfer(träff):
+    with _AKTIV_LÅS:
+        _AKTIVA.pop(träff, None)
 
 
 def active_dict():
     """None när inget pågår; annars läge, procent och fart för panelen."""
-    if not ACTIVE["dir"]:
-        return None
-    total, done = ACTIVE["total"], ACTIVE["done"]
-    elapsed = max(time.monotonic() - ACTIVE["t0"], 0.001)
+    with _AKTIV_LÅS:
+        if not _AKTIVA:
+            return None
+        burk = dict(_AKTIVA[max(_AKTIVA)])       # högst handtag = senast startad
+    total, done = burk["total"], burk["done"]
+    elapsed = max(time.monotonic() - burk["t0"], 0.001)
     return {
-        "dir": ACTIVE["dir"],
-        "name": ACTIVE["name"],
+        "dir": burk["dir"],
+        "name": burk["name"],
         "done": done,
         "total": total,
-        "pct": int(done * 100 / total) if total else 0,
+        # En lögnaktig Content-Length kan göra done > total; panelen ska inte visa 120 %.
+        "pct": min(100, int(done * 100 / total)) if total else 0,
         "speed": done / elapsed,
         "human_done": human_size(done),
         "human_total": human_size(total),
@@ -980,6 +1008,33 @@ class DeadlineReader(io.RawIOBase):
         return fått
 
 
+def svarsfrist(storlek):
+    """Hur länge ett svar får ta, givet sin storlek: golv + storlek/minimihastighet."""
+    return max(RESPONSE_MIN, storlek / max(RESPONSE_RATE, 1.0))
+
+
+def skriv_takad(sock, data, slut=None, block=65536):
+    """Skickar ett svar inom en absolut frist — och mäter mellan VARJE syscall.
+
+    `sendall` (som `wfile.write` använder) blockerar tills HELA biten är skickad, och
+    mot en motpart som sippar återvänder varje enskild `send` så fort en byte får plats
+    i fönstret: per-skrivnings-timeouten slår därför aldrig till, och en frist som bara
+    mäts mellan blocken nås aldrig. Mätt: servern stod i samma `sendall` i över 20 s
+    medan fristen var 2 s — en stor nedladdning höll tråden och en av
+    anslutningsplatserna så länge motparten orkade läsa (HANCORE, ärende 10821: samma
+    klass som läsningen, där fristen mäts mellan läsningarna). Här är det `send`, en
+    syscall i taget, med fristen mätt före varje.
+    """
+    if slut is None:
+        slut = time.monotonic() + svarsfrist(len(data))
+    vy = memoryview(data)
+    med = 0
+    while med < len(vy):
+        if time.monotonic() > slut:
+            raise TimeoutError("fristen för svaret är slut")
+        med += sock.send(vy[med:med + block])
+
+
 class SlingHandler(BaseHTTPRequestHandler):
     server_version = "Sling/" + VERSION
     protocol_version = "HTTP/1.1"
@@ -1012,6 +1067,19 @@ class SlingHandler(BaseHTTPRequestHandler):
             self.connection.settimeout(SOCKET_TIMEOUT)
         except OSError:
             pass
+
+    def handle(self):
+        """En frist som slår till mitt i ett svar stänger anslutningen i tysthet.
+
+        BaseHTTPRequestHandler fångar bara TimeoutError kring LÄSNINGEN av förfrågan;
+        en frist som biter under svaret (se skriv_takad) skulle annars hamna i
+        socketservers felrapport som ett spår av ett oväntat fel. Anslutningen ska
+        bara stängas — halva svaret kan inte bli en keep-alive-förfrågan.
+        """
+        try:
+            super().handle()
+        except TimeoutError:
+            self.close_connection = True
 
     def handle_one_request(self):
         """Ny frist för varje förfrågan på anslutningen (keep-alive börjar om)."""
@@ -1046,7 +1114,9 @@ class SlingHandler(BaseHTTPRequestHandler):
             self.send_header(key, value)
         self.end_headers()
         if body:
-            self.wfile.write(body)
+            # Kroppen skickas inom svarets frist (se skriv_takad): små kroppar ryms i
+            # socketbufferten och kan inte hållas, men koden ska inte lita på det.
+            skriv_takad(self.connection, body)
 
     def _no_token(self):
         self._send(403, ("Sling is running. Use the link or QR code from the bar panel.\n"
@@ -1118,15 +1188,25 @@ class SlingHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + urllib.parse.quote(name))
                 self.send_header("Content-Length", str(size))
                 self.end_headers()
-                start_transfer("down", name, size)
+                träff = start_transfer("down", name, size)
+                # Svaret har sin egen absoluta frist (se skriv_takad): en motpart som läser
+                # en byte då och då höll förut tråden och en av anslutningsplatserna under
+                # hela filen — för en stor fil i praktiken för evigt, och med en bump per
+                # bit hölls avväpningstimern också levande.
+                slut = time.monotonic() + svarsfrist(size)
                 try:
                     while chunk := handtag.read(262144):   # färre väckningar per byte, mätt lika snabbt som 64 KB
-                        self.wfile.write(chunk)
-                        bump_transfer(len(chunk))
+                        skriv_takad(self.connection, chunk, slut)
+                        bump_transfer(träff, len(chunk))
                 except (BrokenPipeError, ConnectionResetError):
                     log("avbruten nedladdning: %s" % name)
+                except TimeoutError:
+                    # Fristen för svaret tog slut mitt i filen: logga varför, och låt
+                    # handle_one_request kasta anslutningen (halv kropp, ingen keep-alive).
+                    log("nedladdning avbruten efter fristen: %s" % name)
+                    raise
                 finally:
-                    end_transfer()
+                    end_transfer(träff)
 
         else:
             self._send(404)
@@ -1214,12 +1294,11 @@ class SlingHandler(BaseHTTPRequestHandler):
             self._send(413, json.dumps({"ok": False, "error": "too large"}).encode(), "application/json")
             return
 
-        def track(nbytes, name=None):
-            if name:
-                ACTIVE["name"] = name
-            bump_transfer(nbytes)
+        träff = start_transfer("up", "", length)
 
-        start_transfer("up", "", length)
+        def track(nbytes, name=None):
+            bump_transfer(träff, nbytes, name)
+
         try:
             saved = stream_multipart(self.rfile, ctype, length, RECEIVED_DIR, on_progress=track)
         except TimeoutError:
@@ -1233,7 +1312,7 @@ class SlingHandler(BaseHTTPRequestHandler):
             self._send(500, json.dumps({"ok": False, "error": str(exc)}).encode(), "application/json")
             return
         finally:
-            end_transfer()
+            end_transfer(träff)
 
         if saved:
             key = "received_single" if len(saved) == 1 else "received_multi"
@@ -1302,6 +1381,17 @@ def status_dict(running=None):
     ip = get_local_ip()
     if running is None:
         running = port_open()
+    # En öppen port säger ingenting om VEM som lyssnar. Panelen frågar den här vägen
+    # var 1,5 s och ritade förut "igång" med URL och en skannbar QR så snart porten
+    # svarade — mätt med en främmande lyssnare på porten: running=true, url med vår
+    # token, qr_ok=true, medan ingenting av vårt var uppe (adressen ledde till en 403
+    # eller till någon annans svar). "igång" betyder att vår server svarade med vår
+    # token; port_open är bara ett billigt förfilter. En serverprocess vet själv att
+    # den kör (IS_SERVER) och frågar inte sig själv.
+    live = None
+    if running and not IS_SERVER:
+        live = server_status(token) if token else None
+        running = live is not None
     if running:
         generate_qr(server_url(token, ip))
     data = {
@@ -1325,10 +1415,8 @@ def status_dict(running=None):
     # En pågående överföring finns bara i serverprocessens minne. CLI:t — och
     # därmed panelens poll — måste hämta den från serverns eget /status; annars
     # stod docken på "redo" medan en fil rullade (mätt).
-    if running and not IS_SERVER:
-        live = server_status(token)
-        if live and "active" in live:
-            data["active"] = live["active"]
+    if live and "active" in live:
+        data["active"] = live["active"]
     return data
 
 
@@ -1477,9 +1565,9 @@ def cmd_server():
                # klart: läsetningen är girig (upp till 256 KiB), så en långsam klient
                # ger inga avbrott emellan. Mätt med taket satt till 2 s: en överföring
                # kapades efter 3,6 s. En klient som slutar skicka fastnar i
-               # läsdeadlinen (SOCKET_TIMEOUT) och då nollas ACTIVE, så taket gäller
+               # läsdeadlinen (SOCKET_TIMEOUT) och då tas burken bort, så taket gäller
                # fortfarande för en död transfer.
-               or ACTIVE["dir"]):
+               or _AKTIVA):
             time.sleep(2)
         log("ingen trafik på %ds — avväpnar" % IDLE_TIMEOUT)
     except (KeyboardInterrupt, SystemExit):
@@ -2006,6 +2094,10 @@ def cmd_selftest(abuse=False):
                SLING_REQUEST_DEADLINE="2",
                SLING_BODY_MIN="2",
                SLING_BODY_RATE="8192",
+               # Svarets frist prövas i abuse-sviten (en motpart som sippar en nedladdning):
+               # högt golv-värde och hög sats gör att provets frist blir några sekunder.
+               SLING_RESPONSE_MIN="2",
+               SLING_RESPONSE_RATE="67108864",
                SLING_CLIP_TIMEOUT="1.5",              # provet för en hängande wl-copy
                XDG_RUNTIME_DIR=tmp,
                XDG_STATE_HOME=tmp,
@@ -2769,9 +2861,32 @@ def cmd_selftest(abuse=False):
         # LAST_ACTIVITY, så utan det stod klockan still under en överföring.
         före_aktivitet = LAST_ACTIVITY["t"]
         time.sleep(0.05)
-        bump_transfer(1)
+        provträff = start_transfer("up", "aktivitet.bin", 10)
+        bump_transfer(provträff, 1)
         check("varje överförd bit räknas som aktivitet", LAST_ACTIVITY["t"] > före_aktivitet,
               "%.3f -> %.3f" % (före_aktivitet, LAST_ACTIVITY["t"]))
+        end_transfer(provträff)
+
+        # Två överföringar samtidigt (webbläsaren skickar två filer i samma POST, och en
+        # nedladdning kan rulla medan en uppladdning pågår): med EN global burk skrev den
+        # senare över den tidigare — namn, total och procent kunde komma från olika filer,
+        # och den ena syntes inte alls (mätt: name från den andra, den första borta).
+        # Varje överföring har nu sin egen burk och ett eget handtag.
+        a = start_transfer("up", "a.bin", 1000)
+        bump_transfer(a, 100)
+        b = start_transfer("down", "b.iso", 2000)
+        bump_transfer(b, 500)
+        bump_transfer(a, 100)          # den äldre räknar vidare utan att röra den senare
+        nu = active_dict()
+        check("två samtidiga överföringar blandas inte: panelen visar den senaste",
+              bool(nu) and nu["name"] == "b.iso" and nu["dir"] == "down" and nu["done"] == 500
+              and nu["total"] == 2000 and nu["pct"] == 25, str(nu))
+        end_transfer(b)
+        nu2 = active_dict()
+        check("  ... och när den tar slut visas den som fortfarande rullar",
+              bool(nu2) and nu2["name"] == "a.bin" and nu2["done"] == 200 and nu2["pct"] == 20, str(nu2))
+        end_transfer(a)
+        check("  ... och när ingen är kvar är inget pågående", active_dict() is None)
 
         # Panelens egen väg: `omarchy-sling status` (CLI) måste visa samma pågående
         # överföring — den finns bara i serverprocessens minne och läses ur /status.
@@ -3034,7 +3149,8 @@ def cmd_selftest(abuse=False):
 
         if abuse:
             abuse_rapport = cmd_abuse({"check": check, "post": post, "multipart": multipart,
-                                       "counted": counted, "shim": shim, "proc": proc},
+                                       "counted": counted, "shim": shim, "proc": proc,
+                                       "env": env},        # så att provet vet serverns frister
                                       port, token, tmp)
     finally:
         proc.terminate()
@@ -3145,6 +3261,32 @@ def cmd_selftest(abuse=False):
               namnbärare.poll() is None and sub_pid in server_pids(),
               "namnbärare %s, sub-server %s" % (namnbärare.poll(), lever(sub_pid)))
         namnbärare.kill()
+
+        # Panelens "igång" kommer från att PORTEN svarar — men det säger ingenting om VEM
+        # som lyssnar. Med en främmande lyssnare på porten visade `status` förut running=true,
+        # vår URL och en skannbar QR medan ingenting av vårt var uppe (mätt: en lyssnare som
+        # svarade "hi" gav running=True, url med vår token, qr_ok=True). Nu betyder "igång"
+        # att vår server svarade med vår token; port_open är bara ett billigt förfilter.
+        främmande2 = socket.socket()
+        främmande2.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        främmande2.bind(("127.0.0.1", sub_port + 11))
+        främmande2.listen(1)                    # lyssnar, svarar aldrig
+        tokenfil = os.path.join(tmp, "token-frammande-lyssnare")
+        with open(tokenfil, "w") as fh:
+            fh.write("f" * 24)
+        sparat_status = (globals()["PORT"], globals()["TOKEN_FILE"], globals()["_TOKEN"])
+        globals()["PORT"] = sub_port + 11
+        globals()["TOKEN_FILE"] = tokenfil
+        globals()["_TOKEN"] = ""
+        try:
+            st = status_dict()
+        finally:
+            (globals()["PORT"], globals()["TOKEN_FILE"],
+             globals()["_TOKEN"]) = sparat_status
+            främmande2.close()
+        check("status säger inte 'igång' för en främmande lyssnare",
+              st.get("running") is False,
+              "running=%s, url=%s, qr_ok=%s" % (st.get("running"), st.get("url"), st.get("qr_ok")))
 
         # och stoppet stänger sub-servern (pid-vägen, som är den vanliga)
         stopp = subprocess.run([sys.executable, os.path.abspath(__file__), "stop"], env=sub_env,
@@ -3724,6 +3866,81 @@ def cmd_abuse(h, port, token, tmp):
           not status.get("active") and lever_efter(), str(status.get("active")))
     check("abuse: status läcker ingen lokal sökväg till telefonen",
           b"/home/" not in svar and tmp.encode() not in svar, "%d byte svar" % len(svar))
+
+    # Läsningarna hade en absolut frist, men SVARET hade bara en gräns per skrivning.
+    # `sendall` (som wfile.write använder) blockerar tills hela biten är skickad, och mot
+    # en motpart som sippar återvänder varje enskild `send` så fort en byte får plats i
+    # fönstret — per-skrivnings-timeouten slog aldrig till, och en frist som bara mättes
+    # mellan blocken nåddes aldrig (mätt: servern stod i samma sendall i över 20 s medan
+    # fristen var 2 s). En stor nedladdning höll alltså tråden och en av
+    # anslutningsplatserna så länge motparten orkade läsa (HANCORE, ärende 10821 — samma
+    # klass som läsningen). Nu mäts fristen före varje `send`, och överföringen ges upp.
+    #
+    # Provet mäter serverns EGET tillstånd efter fristen: att överföringen är borta ur
+    # /status och att bara en bråkdel av filen gick ut. Att vänta på att klienten ser
+    # stängningen duger inte — kerneln ligger kvar med ~2 MB buffrad data som sippar ut
+    # långsamt, vilket är just varför fristen behövs.
+    #
+    # Ärligt om vad provet bevisar: det är en VAKT för utfallet, inte ett bevis för just
+    # fristen. På den gamla koden (wfile.write utan frist) föll cellen inte i den här
+    # körningen, eftersom en enskild skrivning *ibland* ändå slår ifrån på
+    # per-skrivnings-timeouten (3 s i provet) — samma kod och samma klient gav 26 s utan
+    # kapning i mätprovet (se nedan). Fristens bevis är mätprovet: med fristen satt till
+    # 2 s stod servern kvar i SAMMA `sendall` i över 20 s, två körningar i rad, medan
+    # klienten sippade — per-skrivnings-timeouten är ingen frist, den råkar bara ibland.
+    sippfil = os.path.join(send_dir, "sippas.bin")
+    storlek = 96 * 1024 * 1024
+    with open(sippfil, "wb") as fh:
+        fh.truncate(storlek)                   # gles fil: innehållet spelar ingen roll
+    svar_min = float(h["env"].get("SLING_RESPONSE_MIN", "30"))
+    svar_sats = float(h["env"].get("SLING_RESPONSE_RATE", "65536"))
+    frist = max(svar_min, storlek / svar_sats)
+    s = socket.create_connection(("127.0.0.1", port), timeout=10)
+    s.settimeout(1.5)
+    läste, började = 0, time.monotonic()
+    try:
+        s.sendall(b"GET /t/%s/download/sippas.bin HTTP/1.0\r\n\r\n" % token.encode())
+        slut = började + frist + int(os.environ.get("SLING_SOCKET_TIMEOUT") or 3) + 3
+        while time.monotonic() < slut:
+            time.sleep(1.0)                    # sippar: en läsning i sekunden — tätare än
+                                               # SOCKET_TIMEOUT (3 s i provet), så den
+                                               # enskilda skrivningen hinner aldrig slå
+                                               # ifrån: bara fristen kan kapa den
+            try:
+                bit = s.recv(65536)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not bit:
+                break
+            läste += len(bit)
+        svar, _ = raw(b"GET /t/%s/status HTTP/1.0\r\n\r\n" % token.encode())
+        try:
+            aktiv = json.loads(svar.split(b"\r\n\r\n", 1)[1]).get("active")
+        except (ValueError, IndexError):
+            aktiv = "kunde inte läsas"
+        check("abuse: en nedladdning till en sippande motpart ges upp efter fristen",
+              aktiv is None and läste < storlek // 10,
+              "active=%s efter %.1f s, %d byte av %d (frist %.1f s)"
+              % (aktiv, time.monotonic() - började, läste, storlek, frist))
+        # ... och anslutningen är stängd, inte bara bortglömd: när bufferten tömts får
+        # klienten EOF. (Läs fort: kerneln ligger kvar med ~2 MB som annars sippar ut.)
+        s.settimeout(10)
+        stängd = False
+        while True:
+            try:
+                bit = s.recv(1 << 20)
+            except (socket.timeout, OSError):
+                break
+            if not bit:
+                stängd = True
+                break
+            läste += len(bit)
+    finally:
+        s.close()
+    check("abuse: ... och anslutningen stängs i stället för att lämnas halvskriven", stängd,
+          "%d byte lästes totalt" % läste)
 
     # --- /clip: texten, gränsen och att inget går via argv ---
     svar, _ = raw(b"GET /t/%s/clip HTTP/1.0\r\n\r\n" % token.encode())
