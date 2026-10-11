@@ -11,6 +11,7 @@
 
 import ast
 import html
+import http.client
 import json
 import os
 import re
@@ -44,7 +45,9 @@ SOCKET_TIMEOUT = int(os.environ.get("SLING_SOCKET_TIMEOUT", 30))
 # Tak för CLI:ts läsning av serverns eget /status. Panelen pollar den vägen, och en
 # granne på samma konto kan binda porten före oss och svara själv: utan tak buffras
 # ett ändlöst svar tills minnet tar slut, och urllibs timeout (per läsning) gör ingen
-# nytta mot en som droppar en byte då och då.
+# nytta mot en som droppar en byte då och då. Två tak: storleken på kroppen, och EN
+# absolut deadline för HELA transaktionen (statusrad, huvuden, chunk-ramverk, kropp) —
+# en tidsgräns per läsning håller inte mot en motpart som droppar innanför den.
 STATUS_MAX = int(os.environ.get("SLING_STATUS_MAX", 1024 * 1024))
 STATUS_DEADLINE = float(os.environ.get("SLING_STATUS_DEADLINE", "4"))
 MDNS_NAME = os.environ.get("SLING_MDNS_NAME", "sling")
@@ -1239,14 +1242,48 @@ def status_dict(running=None):
     return data
 
 
+class DeadlineSocket(socket.socket):
+    """En socket där VARJE läsning mäts mot EN absolut deadline.
+
+    En tidsgräns per läsning (`socket.settimeout`, och därmed urllibs `timeout`) räcker
+    inte mot en motpart som droppar en byte strax innanför den: varje enskild läsning
+    lyckas, så anropet håller kvar hur länge som helst. Och det gäller hela svarståget,
+    inte bara kroppen — `http.client` läser statusraden, varje huvud, chunk-huvudena och
+    trailers med samma socket (HANCORE, ärende 10821: kroppen var takad, men en motpart
+    som droppade statusraden eller chunk-ramverket höll pollningen förbi taket ändå).
+    Här räknas tiden om före varje läsning, så hela transaktionen tar slut i tid.
+    """
+
+    def __init__(self, slut):
+        super().__init__(socket.AF_INET, socket.SOCK_STREAM)
+        self._slut = slut
+
+    def _kvar(self):
+        kvar = self._slut - time.monotonic()
+        if kvar <= 0:
+            raise TimeoutError("tidsgränsen för hela transaktionen är passerad")
+        return kvar
+
+    def recv(self, *a, **kw):
+        self.settimeout(self._kvar())
+        return super().recv(*a, **kw)
+
+    def recv_into(self, *a, **kw):
+        self.settimeout(self._kvar())
+        return super().recv_into(*a, **kw)
+
+
 def läs_takad(r, tak=STATUS_MAX, deadline=STATUS_DEADLINE):
-    """Läser ett HTTP-svar med tak i både storlek och TID, eller None.
+    """Kroppen i ett HTTP-svar, med tak i både storlek och tid — eller None.
+
+    Storlekstaket bor här; tidsgränsen i `deadline` är bara ett mellanled (den hindrar
+    en oändlig ström från att fylla minnet innan socketen hinner säga ifrån). Den som
+    håller hela transaktionen i tid är `DeadlineSocket`, inte den här loopen.
 
     `read1`, inte `read`: `read(65536)` väntar tills bufferten är full, så en
     motpart som droppar en byte då och då håller kvar en enskild läsning hur länge
     som helst (mätt: ingen återkomst inom 20 s) medan `read1` ger tillbaka till
-    deadline-kontrollen varje gång. Både storleken och tiden måste ha ett tak:
-    urllibs `timeout` gäller per läsning, inte för hela svaret.
+    deadline-kontrollen varje gång.
     """
     slut = time.monotonic() + deadline
     bitar, med = [], 0
@@ -1263,22 +1300,39 @@ def läs_takad(r, tak=STATUS_MAX, deadline=STATUS_DEADLINE):
     return b"".join(bitar)
 
 
-def server_status(token):
+def server_status(token, deadline=STATUS_DEADLINE, tak=STATUS_MAX):
     """Serverns egen /status, eller None om den inte svarar.
 
     En granne på samma konto kan binda porten före oss och svara själv, och panelen
     pollar den här vägen var 1,5 s. Mätt mot en främmande lyssnare: ett svar utan
     slut buffrades till 277 MB innan minnestaket slog till, och ett svar som droppade
     en byte då och då höll kommandot kvar utan återkomst i 25 s (HANCORE, ärende 10821).
-    Taket i storlek är 1 MB: det rymmer tusentals köade filer i svaret, men inte ett
-    svar som aldrig tar slut.
+
+    Transaktionen skrivs därför för hand i stället för med `urlopen`: bara så kan
+    socketen — och därmed statusrad, huvuden, chunk-ramverk och kropp — bära samma
+    absoluta deadline. En motpart på porten kan dra ut på vilket av dem som helst.
     """
+    slut = time.monotonic() + deadline
+    s = None
     try:
-        with urllib.request.urlopen("http://127.0.0.1:%d/t/%s/status" % (PORT, token), timeout=2) as r:
-            kropp = läs_takad(r)
+        s = DeadlineSocket(slut)
+        s.connect(("127.0.0.1", PORT))
+        s.sendall(b"GET /t/%s/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+                  % token.encode("utf-8"))
+        r = http.client.HTTPResponse(s, method="GET")
+        r.begin()
+        if r.status != 200:               # fel token, eller någon annans svar
+            return None
+        kropp = läs_takad(r, tak=tak, deadline=deadline)
         return json.loads(kropp) if kropp is not None else None
-    except Exception:
+    except Exception:                     # noqa: BLE001 — inget svar räknas som inget svar
         return None
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except OSError:
+                pass
 
 
 # ------------------------------------------------------------------------------
@@ -1639,7 +1693,9 @@ STRYP_UNDANTAG = (
 # undantag gick `r.read()` i server_status fri, eftersom funktionen redan stod i
 # tabellen för sin urlopen — precis den klass inventeringen finns för att fånga.)
 STRYP_NÄT_UNDANTAG = (
-    ("server_status", "läser_takad(): STATUS_MAX byte OCH STATUS_DEADLINE sekunder"),
+    ("server_status", "DeadlineSocket: EN absolut deadline över hela transaktionen, plus STATUS_MAX byte kropp"),
+    ("get_local_ip", "UDP-anslutning utan trafik — väljer bara rutt, läser inget, kan inte hänga"),
+    ("port_open", "connect_ex med 0,3 s tak och ingen läsning — svarar bara ja/nej"),
     ("cmd_selftest", "prov mot svitens egen server i scratch"),
     ("cmd_abuse", "samma som cmd_selftest, för den otillförlitliga ytan"),
 )
@@ -1690,7 +1746,8 @@ def granska_sankor(källa=None, rapportera=False):
             return "läsningar"
         if sista in ("wait", "communicate"):
             return "väntningar"
-        if namn.endswith("urlopen"):
+        if (namn.endswith("urlopen") or namn.endswith("create_connection")
+                or sista in ("connect", "connect_ex")):
             return "nät"
         return ""
 
@@ -2929,12 +2986,23 @@ def cmd_selftest(abuse=False):
     # läsaren i ett barn med 300 MB minnestak, så ett ändlöst svar syns som ett
     # topp-minne långt över taket i stället för som svält på maskinen.
     def starta_squatter(egen_port, beteende):
-        """En främmande lyssnare på porten: tiger, droppar en byte då och då, eller strömmar."""
+        """En främmande lyssnare på porten som drar ut på olika steg i svarståget.
+
+        HANCORE:s andra varv (2026-10-10): kroppen var takad, men `urlopen` läste
+        statusrad, huvuden och chunk-ramverk innanför en tidsgräns PER LÄSNING — en
+        motpart som droppade en byte innanför den höll kvar pollningen ändå. Fyra
+        varianter täcker var sitt steg, plus kroppen och tystnaden.
+        """
         sq = socket.socket()
         sq.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sq.bind(("127.0.0.1", egen_port))
         sq.listen(5)
         sq_stopp = threading.Event()
+
+        def droppa(klient, bit):
+            while not sq_stopp.is_set():
+                time.sleep(0.2)
+                klient.sendall(bit)
 
         def betjäna():
             while not sq_stopp.is_set():
@@ -2946,24 +3014,41 @@ def cmd_selftest(abuse=False):
                     klient.recv(65536)
                     if beteende == "tiger":
                         continue                     # svarar aldrig
-                    klient.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n")
-                    if beteende == "droppar":
-                        klient.sendall(b'{"running": true')
+                    if beteende == "statusrad":
+                        droppa(klient, b"H")         # statusraden tar aldrig slut
+                        continue
+                    klient.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n")
+                    if beteende == "huvud":
+                        droppa(klient, b"X")         # ett huvud tar aldrig slut
+                    elif beteende == "chunk":
+                        klient.sendall(b"Transfer-Encoding: chunked\r\n\r\n")
+                        droppa(klient, b"f")         # chunk-huvudet tar aldrig slut
+                    elif beteende == "trailer":
+                        # En komplett första chunk, sedan ett trailer-block som droppas.
+                        klient.sendall(b"Transfer-Encoding: chunked\r\n\r\n5\r\nhej!!\r\n0\r\n")
+                        droppa(klient, b"X")
+                    elif beteende == "droppar":
+                        klient.sendall(b"\r\n")
+                        droppa(klient, b"x")
+                    else:                            # strömmar
+                        klient.sendall(b"\r\n")
                         while not sq_stopp.is_set():
-                            time.sleep(0.2)
-                            klient.sendall(b"x")
-                    else:
-                        bit = b"x" * 262144
-                        while not sq_stopp.is_set():
-                            klient.sendall(bit)
+                            klient.sendall(b"x" * 262144)
                 except OSError:
                     pass
 
         threading.Thread(target=betjäna, daemon=True).start()
         return sq, sq_stopp
 
+    # Varje steg i svarståget får sin egen motpart: annars mäter provet bara det steg
+    # någon råkade tänka på. (Ingångsmatrisen nedan prövar i stället VILKA ingångar som
+    # kan hänga; faserna hör hit, där varje motpart kostar en körning.)
     for etikett, beteende, egen_port in (("ett ändlöst svar", "strömmar", port + 3),
-                                         ("ett droppande svar", "droppar", port + 4)):
+                                         ("ett droppande svar", "droppar", port + 4),
+                                         ("en droppande statusrad", "statusrad", port + 17),
+                                         ("ett droppande huvud", "huvud", port + 18),
+                                         ("ett droppande chunk-huvud", "chunk", port + 19),
+                                         ("en droppande trailer", "trailer", port + 20)):
         sq, sq_stopp = starta_squatter(egen_port, beteende)
         läskod = ("import importlib.machinery as m, importlib.util as u, resource, sys, os, time\n"
                   "os.environ['XDG_RUNTIME_DIR'] = %r\n"
