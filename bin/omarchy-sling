@@ -42,6 +42,13 @@ MAX_UPLOAD = int(os.environ.get("SLING_MAX_UPLOAD", 2 * 1024**3))
 # filer, vilket räcker för att äta upp inoderna på en vanlig hempartition. Delar som
 # blir filer räknas därför per förfrågan, och en förfrågan över taket vägras som helhet.
 MAX_PARTS = int(os.environ.get("SLING_MAX_PARTS", "1000"))
+
+# Golv för ledigt utrymme på partitionen kroppen skrivs till. Taket är per förfrågan, inte
+# en kvot: N förfrågningar fyller partitionen, och en full disk drabbar allt annat som
+# ligger på den. Ingen kvot behövs — utrymmet är redan känt, så det räcker att titta på
+# det innan kroppen läses. ponytail: ett golv, ingen bokföring; en tokenhållare kan fylla
+# partitionen ned till golvet och inget här raderar något — återvinning är en egen fråga.
+MIN_FREE = int(os.environ.get("SLING_MIN_FREE", 256 * 1024 * 1024))
 # Tak för samtidiga anslutningar och tystnad per anslutning. Token kontrolleras
 # först när förfrågan är läst, så utan tak kan en granne på LAN:et öppna
 # anslutningar, tiga, och hålla en tråd och en fildeskriptor per anslutning.
@@ -1150,6 +1157,21 @@ class SlingHandler(BaseHTTPRequestHandler):
         self._send(403, ("Sling is running. Use the link or QR code from the bar panel.\n"
                          "Sling körs. Använd länken eller QR-koden i panelen.\n").encode())
 
+    def _släpp_kroppen(self, längd):
+        """Läs och släng kroppen (upp till 8 MB), och stäng anslutningen.
+
+        Klienten ska få beskedet i stället för en bruten anslutning mitt i sin egen
+        uppladdning, och resten av kroppen får inte bli nästa förfrågan på samma
+        anslutning (samma skäl som _stäng_om_kroppen_lämnades).
+        """
+        self.close_connection = True
+        kvar = min(längd, 8 * 1024 * 1024)
+        while kvar > 0:
+            bit = self.rfile.read(min(65536, kvar))
+            if not bit:
+                break
+            kvar -= len(bit)
+
     def _stäng_om_kroppen_lämnades(self):
         """Svar på en förfrågan vars deklarerade kropp vi inte läser.
 
@@ -1324,19 +1346,24 @@ class SlingHandler(BaseHTTPRequestHandler):
         # Kroppens frist (se DeadlineReader). Över taket läses bara den del som ändå ska
         # slängas, så en lögnaktig Content-Length inte ger timmar åt en som droppar.
         self.rfile.raw.arm_kropp(8 * 1024 * 1024 if length > MAX_UPLOAD else length)
+        # Ryms kroppen med golvet kvar? Frågan ställs till filsystemet i stället för till
+        # en kvotbokföring: utrymmet är redan känt, och det skyddar allt annat på samma
+        # partition också. En lögnaktig Content-Length kostar inget — kontrollen sker före
+        # första läsningen, och kroppen läses bara så långt tömningen går.
+        if shutil.disk_usage(RECEIVED_DIR).free - length < MIN_FREE:
+            log("avvisade uppladdning på %d byte (%d byte ledigt, golv %d)"
+                % (length, shutil.disk_usage(RECEIVED_DIR).free, MIN_FREE))
+            self._släpp_kroppen(length)
+            self._send(507, json.dumps({"ok": False, "error": "not enough room"}).encode(),
+                       "application/json")
+            return
         if length > MAX_UPLOAD:
             log("avvisade uppladdning på %d byte (tak %d)" % (length, MAX_UPLOAD))
             # Läs och släng kroppen (upp till 8 MB) INNAN svaret skickas: annars
             # får klienten en bruten anslutning mitt i sin egen uppladdning i
             # stället för beskedet. Sedan stängs anslutningen — resten av kroppen
             # skulle annars tolkas som nästa förfrågan.
-            self.close_connection = True
-            drain = min(length, 8 * 1024 * 1024)
-            while drain > 0:
-                chunk = self.rfile.read(min(65536, drain))
-                if not chunk:
-                    break
-                drain -= len(chunk)
+            self._släpp_kroppen(length)
             self._send(413, json.dumps({"ok": False, "error": "too large"}).encode(), "application/json")
             return
 
@@ -3890,6 +3917,20 @@ def cmd_abuse(h, port, token, tmp):
                                              + b"Content-Length: %d\r\n\r\n" % len(gömd) + gömd)
         check("abuse: en oläst kropp blir inte nästa förfrågan (%s)" % vad,
               antal == 1 and stängd, "%d svar, stängd=%s" % (antal, stängd))
+
+    # Taket är per förfrågan, inte en kvot: N förfrågningar fyller partitionen. Ingen kvot
+    # behövs — utrymmet är redan känt, så servern tittar på det innan kroppen läses
+    # (mätt: en full disk gav en ren 500 utan halv fil, men ingen hade räknat utrymmet
+    # först). En deklarerad kropp på 1 PiB ryms aldrig, och svaret kommer utan att en enda
+    # byte skrivs. Halvstängd skrivsida: tömningen ser EOF direkt i stället för att vänta
+    # ut kroppens frist.
+    före = set(katalog(received))
+    svar, _ = raw(("POST /t/%s/upload HTTP/1.0\r\nContent-Type: multipart/form-data; boundary=X\r\n"
+                   "Content-Length: %d\r\n\r\n" % (token, 1 << 50)).encode() + b"x" * 64,
+                  half_close=True, timeout=8)
+    check("abuse: en kropp som inte ryms på partitionen vägras utan att något skrivs",
+          kod(svar) == 507 and set(katalog(received)) == före and b"not enough room" in svar,
+          "kod %d" % kod(svar))
 
     # Ett misslyckat sparande skickade förr str(exc) till telefonen: mätt innehöll 500-svaret
     # "[Errno 13] Permission denied: /home/…/Received/b.bin". Detaljen stannar nu i loggen,
