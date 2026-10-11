@@ -35,6 +35,13 @@ VERSION = "1.3.0"
 PORT = int(os.environ.get("SLING_PORT", 5380))
 IDLE_TIMEOUT = int(os.environ.get("SLING_IDLE_TIMEOUT", 900))
 MAX_UPLOAD = int(os.environ.get("SLING_MAX_UPLOAD", 2 * 1024**3))
+# Taket ovan mäter BYTE, inte filer. En förfrågan kan bära hur många delar som helst,
+# och varje del blir en egen fil i Received: mätt gav en kropp på 366 KB med 3000 delar
+# på 1 byte 3000 filer och 12,3 MB på disk (32,8 gånger kroppen — varje fil kostar 4 KB
+# i block), och svaret bär varje namn. En förfrågan på 2 GB i smådelar hade gett ~16 M
+# filer, vilket räcker för att äta upp inoderna på en vanlig hempartition. Delar som
+# blir filer räknas därför per förfrågan, och en förfrågan över taket vägras som helhet.
+MAX_PARTS = int(os.environ.get("SLING_MAX_PARTS", "1000"))
 # Tak för samtidiga anslutningar och tystnad per anslutning. Token kontrolleras
 # först när förfrågan är läst, så utan tak kan en granne på LAN:et öppna
 # anslutningar, tiga, och hålla en tråd och en fildeskriptor per anslutning.
@@ -610,6 +617,14 @@ def safe_upload_name(raw):
     return name
 
 
+class TooManyParts(Exception):
+    """Fler filer i en förfrågan än SLING_MAX_PARTS. Bär de filer som hann skrivas."""
+
+    def __init__(self, filer):
+        super().__init__("fler än %d filer i en förfrågan" % MAX_PARTS)
+        self.filer = filer
+
+
 def stream_multipart(rfile, content_type, content_length, save_dir, on_progress=None):
     """Läser multipart-kroppen i bitar och skriver varje fil direkt till disk.
 
@@ -633,6 +648,7 @@ def stream_multipart(rfile, content_type, content_length, save_dir, on_progress=
     remaining = content_length
     out = None                      # (namn, filhandtag)
     saved = []
+    filer = 0                       # delar som blivit filer i den här förfrågan
     state = "preamble"              # preamble -> headers -> data -> headers ...
 
     def close_part(behall=True):
@@ -697,7 +713,15 @@ def stream_multipart(rfile, content_type, content_length, save_dir, on_progress=
                 fn = re.search(r'filename="([^"]*)"', headers)
                 name = safe_upload_name(fn.group(1)) if fn else ""
                 if name:
+                    if filer >= MAX_PARTS:
+                        # Fler filer än taket: vägra hela förfrågan (do_POST städar bort
+                        # det som hann skrivas och svarar 413). Att spara de första och
+                        # strunta i resten vore värre — då ser en vägrad förfrågan ut som
+                        # en lyckad, och mappen har redan fått sina filer.
+                        close_part(behall=False)
+                        raise TooManyParts(saved)
                     name, fh = create_unique(save_dir, name)
+                    filer += 1
                     out = (name, fh)
                     tell(0, name)
                 state = "data"
@@ -1037,6 +1061,10 @@ def skriv_takad(sock, data, slut=None, block=65536):
 
 class SlingHandler(BaseHTTPRequestHandler):
     server_version = "Sling/" + VERSION
+    # BaseHTTPRequestHandler lägger till "Python/3.14.7" efter server_version. Versionen
+    # av interpreteraren är ingen hemlighet på allvar, men den hör inte i varje svar: den
+    # säger vilka CVE:er som är värda att pröva, och ingen på telefonen behöver veta.
+    sys_version = ""
     protocol_version = "HTTP/1.1"
 
     def setup(self):
@@ -1301,6 +1329,20 @@ class SlingHandler(BaseHTTPRequestHandler):
 
         try:
             saved = stream_multipart(self.rfile, ctype, length, RECEIVED_DIR, on_progress=track)
+        except TooManyParts as exc:
+            # Förfrågan vägras som helhet och städas bort: en vägrad förfrågan ska inte
+            # lämna tusentals filer efter sig. Kroppen läses inte klart — den kan vara
+            # gigabyte — så anslutningen stängs i stället för att återanvändas: resten av
+            # kroppen skulle annars tolkas som nästa förfrågan.
+            for namn in exc.filer:
+                try:
+                    os.remove(os.path.join(RECEIVED_DIR, namn))
+                except OSError:
+                    pass
+            log("vägrade en förfrågan med fler än %d filer" % MAX_PARTS)
+            self.close_connection = True
+            self._send(413, json.dumps({"ok": False, "error": "too many files"}).encode(), "application/json")
+            return
         except TimeoutError:
             # Läsdeadlinen slog till mitt i kroppen: klienten är borta, kasta
             # anslutningen (handle_one_request) i stället för att svara på den.
@@ -1308,8 +1350,11 @@ class SlingHandler(BaseHTTPRequestHandler):
         except (OSError, ValueError) as exc:
             # ValueError: ett filnamn ur multipart-rubriken kan innehålla NUL, och open()
             # kastar då — utan det här hade anropet dött utan svar (se safe_upload_name).
+            # Detaljen stannar i loggen: str(exc) kan bära en absolut sökväg — mätt gick
+            # "[Errno 13] Permission denied: /home/…/Received/b.bin" i svarskroppen till
+            # telefonen, samma klass som /status-fyndet.
             log("uppladdning misslyckades: %s" % exc)
-            self._send(500, json.dumps({"ok": False, "error": str(exc)}).encode(), "application/json")
+            self._send(500, json.dumps({"ok": False, "error": "could not save the file"}).encode(), "application/json")
             return
         finally:
             end_transfer(träff)
@@ -2087,6 +2132,7 @@ def cmd_selftest(abuse=False):
                SLING_BASE_DIR=tmp,
                SLING_IDLE_TIMEOUT="60",
                SLING_MAX_UPLOAD="2097152",            # 2 MB i provet
+               SLING_MAX_PARTS="8",                   # taket på antal FILER per förfrågan (prov nedan)
                SLING_MAX_CONNECTIONS="16",            # taket prövas nedan (12 samtidiga i kapplöpningsprovet)
                SLING_SOCKET_TIMEOUT="3",
                # Förfrågans och kroppens frister: korta i provet så att de går att mäta
@@ -2130,6 +2176,8 @@ def cmd_selftest(abuse=False):
                 hits.append((n, "namn jämfört i argv i stället för form", rad.strip()))
             if re.search(r"os\.open\(", rad) and not re.search(r"0o[0-7]{3}", rad):
                 hits.append((n, "os.open utan mode vid skapandet", rad.strip()))
+            if re.search(r"_send\(", rad) and re.search(r"str\(\s*exc\s*\)|%\s*exc\b", rad):
+                hits.append((n, "undantagstext i en svarskropp", rad.strip()))
         return hits
 
     def multipart(files):
@@ -2178,11 +2226,17 @@ def cmd_selftest(abuse=False):
               not [h for h in _traffar if "argv" in h[1]], str(_traffar[:1]))
         check("varje os.open bär mode vid skapandet",
               not [h for h in _traffar if "mode" in h[1]], str(_traffar[:1]))
+        check("ingen undantagstext i en svarskropp (den kan bära en lokal sökväg)",
+              not [h for h in _traffar if "svarskropp" in h[1]], str(_traffar[:1]))
         _gammal = ('    if "sling" in argv:\n'
                    '        os.kill(pid, signal.SIGTERM)\n'
                    '    fd = os.open(path, os.O_WRONLY | os.O_CREAT)\n')
         check("grindarna biter på de gamla formerna", len(source_shape_hits(_gammal)) == 2,
               str(source_shape_hits(_gammal)))
+        _gammal_svar = ('    self._send(500, json.dumps({"ok": False, "error": str(exc)}).encode(), "application/json")\n')
+        check("  ... och på den gamla formen: undantagstext i svaret",
+              [h[1] for h in source_shape_hits(_gammal_svar)] == ["undantagstext i en svarskropp"],
+              str(source_shape_hits(_gammal_svar)))
 
         # Inventeringen prövas mot påhittade källtexter, inte bara mot den här filen:
         # en regel som alltid ser grön ut på sin egen fil bevisar ingenting. (HANCORE om
@@ -3756,6 +3810,52 @@ def cmd_abuse(h, port, token, tmp):
     tid = time.monotonic() - t0
     check("abuse: en deklarerad längd långt över taket avvisas utan att vänta på kroppen",
           kod(svar) == 413 and tid < 3, "kod %d efter %.1f s" % (kod(svar), tid))
+
+    # Taket mäter BYTE — inte filer. Mätt: en kropp på 366 KB med 3000 delar på 1 byte gav
+    # 3000 filer och 12,3 MB på disk (32,8 gånger kroppen; varje fil kostar 4 KB i block),
+    # svaret bär varje namn, och en förfrågan på 2 GB i smådelar hade gett ~16 M inoder.
+    # Provet kör med SLING_MAX_PARTS satt till 8: nio delar ska vägras som HELHET, utan att
+    # lämna en enda fil efter sig, medan åtta går igenom (vakten får inte stoppa nyttigt).
+    gräns = int(h["env"].get("SLING_MAX_PARTS", "1000"))
+    kropp, ctype = multipart([("många%02d.bin" % i, b"x") for i in range(gräns + 1)])
+    svar, _ = raw(("POST /t/%s/upload HTTP/1.0\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n"
+                   % (token, ctype, len(kropp))).encode() + kropp)
+    kvar = [n for n in katalog(received) if n.startswith("många")]
+    check("abuse: fler filer än taket vägras som helhet (413) och lämnar inget kvar",
+          kod(svar) == 413 and not kvar and lever_efter(),
+          "kod %d, kvar %s" % (kod(svar), kvar[:3]))
+    kropp, ctype = multipart([("lagom%02d.bin" % i, b"x") for i in range(gräns)])
+    svar, _ = raw(("POST /t/%s/upload HTTP/1.0\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n"
+                   % (token, ctype, len(kropp))).encode() + kropp)
+    lagom = [n for n in katalog(received) if n.startswith("lagom")]
+    check("  ... men en förfrågan precis på taket går igenom",
+          kod(svar) == 200 and len(lagom) == gräns, "kod %d, %d filer" % (kod(svar), len(lagom)))
+    for namn in lagom:
+        try:
+            os.remove(os.path.join(received, namn))
+        except OSError:
+            pass
+
+    # Ett misslyckat sparande skickade förr str(exc) till telefonen: mätt innehöll 500-svaret
+    # "[Errno 13] Permission denied: /home/…/Received/b.bin". Detaljen stannar nu i loggen,
+    # svaret är allmänt — och loggen får fortfarande veta varför.
+    os.chmod(received, 0o500)                 # mottagningskatalogen går inte att skriva i
+    try:
+        kropp, ctype = multipart([("nekad.bin", b"x")])
+        svar, _ = raw(("POST /t/%s/upload HTTP/1.0\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n"
+                       % (token, ctype, len(kropp))).encode() + kropp)
+        text = svar.decode("utf-8", "replace")
+    finally:
+        os.chmod(received, 0o700)
+    try:
+        logg = open(os.path.join(tmp, "sling", "server.log"), errors="replace").read()[-2000:]
+    except OSError:
+        logg = ""
+    check("abuse: ett misslyckat sparande svarar 500 utan lokal sökväg",
+          kod(svar) == 500 and tmp not in text and "/home/" not in text and "Permission denied" not in text,
+          text.split("\r\n\r\n", 1)[-1][:120])
+    check("  ... och orsaken står i loggen", "Permission denied" in logg,
+          (logg.strip().splitlines() or ["(ingen logg)"])[-1][:90])
     kropp, ctype = multipart([("halv.bin", os.urandom(300000))])
     halva = len(kropp) // 2
     raw(("POST /t/%s/upload HTTP/1.0\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n"
