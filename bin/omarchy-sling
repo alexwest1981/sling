@@ -58,6 +58,13 @@ MIN_FREE_FILES = int(os.environ.get("SLING_MIN_FREE_FILES", "1000"))
 # först när förfrågan är läst, så utan tak kan en granne på LAN:et öppna
 # anslutningar, tiga, och hålla en tråd och en fildeskriptor per anslutning.
 MAX_CONNECTIONS = int(os.environ.get("SLING_MAX_CONNECTIONS", 32))
+# Tak per adress. Det globala taket räcker inte: en enda motpart kunde öppna alla 32,
+# tiga, och låta telefonen få 503 — token kontrolleras först när förfrågan är läst.
+# En webbläsare öppnar som mest sex anslutningar per värd, så 16 lämnar rum för en
+# nedladdningshanterare (och för svitens tolv samtidiga uppladdningar) medan en enda
+# motpart inte längre kan ta hela tabellen. Ärligt om gränsen: flera enheter bakom
+# samma NAT delar sina 16 — på ett LAN har varje enhet sin egen adress.
+MAX_PER_IP = int(os.environ.get("SLING_MAX_PER_IP", 16))
 CLIP_MAX = int(os.environ.get("SLING_CLIP_MAX", 64 * 1024))
 # Hur länge en klippkälla får hålla kommandot. En ägare som slutar skriva utan att
 # stänga får inte hänga "Send clipboard to phone".
@@ -220,25 +227,41 @@ def end_transfer(träff):
         _AKTIVA.pop(träff, None)
 
 
-def active_dict():
-    """None när inget pågår; annars läge, procent och fart för panelen."""
+def aktiva_lista():
+    """Alla pågående överföringar, senast startade först.
+
+    Panelen ritar en rad per överföring: med EN burk (eller bara den senaste) syntes
+    den andra inte alls medan båda rullade — mätt: namn, total och procent kunde
+    komma från olika filer.
+    """
     with _AKTIV_LÅS:
-        if not _AKTIVA:
-            return None
-        burk = dict(_AKTIVA[max(_AKTIVA)])       # högst handtag = senast startad
-    total, done = burk["total"], burk["done"]
-    elapsed = max(time.monotonic() - burk["t0"], 0.001)
-    return {
-        "dir": burk["dir"],
-        "name": burk["name"],
-        "done": done,
-        "total": total,
-        # En lögnaktig Content-Length kan göra done > total; panelen ska inte visa 120 %.
-        "pct": min(100, int(done * 100 / total)) if total else 0,
-        "speed": done / elapsed,
-        "human_done": human_size(done),
-        "human_total": human_size(total),
-    }
+        burkar = [dict(_AKTIVA[träff]) for träff in sorted(_AKTIVA, reverse=True)]
+    ut = []
+    for burk in burkar:
+        total, done = burk["total"], burk["done"]
+        elapsed = max(time.monotonic() - burk["t0"], 0.001)
+        ut.append({
+            "dir": burk["dir"],
+            "name": burk["name"],
+            "done": done,
+            "total": total,
+            # En lögnaktig Content-Length kan göra done > total; panelen ska inte visa 120 %.
+            "pct": min(100, int(done * 100 / total)) if total else 0,
+            "speed": done / elapsed,
+            "human_done": human_size(done),
+            "human_total": human_size(total),
+        })
+    return ut
+
+
+def active_dict():
+    """None när inget pågår; annars den senast startade (telefonsidan och baren).
+
+    Samma räkning som listan — den här är bara första posten, så det finns en sanning
+    om procenten och inte två.
+    """
+    lista = aktiva_lista()
+    return lista[0] if lista else None
 
 # ------------------------------------------------------------------------------
 # Notiser i18n (datorns språk)
@@ -1458,20 +1481,52 @@ class SlingServer(ThreadingHTTPServer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        # Per adress: en motpart ska inte kunna ta hela tabellen själv. Utan det här
+        # räckte det att öppna MAX_CONNECTIONS anslutningar och tiga — token kontrolleras
+        # först när förfrågan är läst — och telefonen fick 503 medan ingen av dem gjorde
+        # något. Adressen behövs bara medan någon håller en plats: räknaren går till noll
+        # och nyckeln försvinner, så tabellen växer inte.
+        self._per_adress = {}
+        self._per_adress_lås = threading.Lock()
+
+    def _ta_plats(self, adress):
+        with self._per_adress_lås:
+            antal = self._per_adress.get(adress, 0)
+            if antal >= MAX_PER_IP:
+                return False
+            self._per_adress[adress] = antal + 1
+            return True
+
+    def _släpp_plats(self, adress):
+        with self._per_adress_lås:
+            antal = self._per_adress.get(adress, 0) - 1
+            if antal > 0:
+                self._per_adress[adress] = antal
+            else:
+                self._per_adress.pop(adress, None)
+
+    def _avvisa(self, request):
+        try:
+            request.sendall(b"HTTP/1.1 503 Service Unavailable\r\n"
+                            b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+        except OSError:
+            pass
+        self.shutdown_request(request)
 
     def process_request(self, request, client_address):
+        adress = client_address[0]
         if not self._slots.acquire(blocking=False):
-            try:
-                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\n"
-                                b"Content-Length: 0\r\nConnection: close\r\n\r\n")
-            except OSError:
-                pass
-            self.shutdown_request(request)
+            self._avvisa(request)
+            return
+        if not self._ta_plats(adress):
+            self._slots.release()
+            self._avvisa(request)
             return
         try:
             super().process_request(request, client_address)
         except BaseException:
             self._slots.release()          # tråden startade aldrig
+            self._släpp_plats(adress)
             raise
 
     def process_request_thread(self, request, client_address):
@@ -1479,6 +1534,7 @@ class SlingServer(ThreadingHTTPServer):
             super().process_request_thread(request, client_address)
         finally:
             self._slots.release()
+            self._släpp_plats(client_address[0])
 
     def server_bind(self):
         """Hoppar över BaseHTTPServer.server_bind, som gör en omvänd DNS-lookup
@@ -1529,12 +1585,17 @@ def status_dict(running=None):
         "recent_files": list_files(RECEIVED_DIR, 5),
         "send_files": list_files(SEND_DIR),
         "active": active_dict(),
+        # Listan panelen ritar: en rad per överföring. "active" är den senaste av dem
+        # och finns kvar för telefonsidan och baren.
+        "actives": aktiva_lista(),
     }
     # En pågående överföring finns bara i serverprocessens minne. CLI:t — och
     # därmed panelens poll — måste hämta den från serverns eget /status; annars
     # stod docken på "redo" medan en fil rullade (mätt).
     if live and "active" in live:
         data["active"] = live["active"]
+    if live and "actives" in live:
+        data["actives"] = live["actives"]
     return data
 
 
@@ -2124,15 +2185,19 @@ def granska_sankor(källa=None, rapportera=False, text=None):
     antal = dict.fromkeys(FAMILJER, 0)
     funna = {f: [] for f in FAMILJER}
     per_funktion = {}
+    begagnade = set()
     for fn, f, rad, text, takad in träffar:
+        if fn in STRYP_PROVHALVA:
+            # Svitens egen kod (se kommentaren vid STRYP_PROVHALVA): den räknas inte i
+            # siffrorna — de beskriver plugin:en, inte dess prov — men den markerar sina
+            # pinnar som begagnade. Utan det här skilde sig README:s siffror från svitens
+            # varje gång sviten själv fick ett anrop till (mätt två rundor i rad).
+            begagnade.add((fn, f))
+            continue
         antal[f] += 1
         per_funktion.setdefault((fn, f), []).append((rad, text, takad))
 
-    begagnade = set()
     for (fn, f), poster in per_funktion.items():
-        if fn in STRYP_PROVHALVA:            # svitens egen kod (se kommentaren)
-            begagnade.add((fn, f))
-            continue
         otakade = [p for p in poster if not p[2]]
         if not otakade:
             continue
@@ -2207,6 +2272,11 @@ def cmd_selftest(abuse=False):
                SLING_MAX_UPLOAD="2097152",            # 2 MB i provet
                SLING_MAX_PARTS="8",                   # taket på antal FILER per förfrågan (prov nedan)
                SLING_MAX_CONNECTIONS="16",            # taket prövas nedan (12 samtidiga i kapplöpningsprovet)
+               # Taket PER ADRESS prövas också nedan, och ligger därför strax under det
+               # globala: den trettonde anslutningen från samma adress avvisas medan det
+               # globala taket (16) fortfarande har plats — annars mätte cellen det gamla
+               # taket i stället för det nya. Tolv samtidiga uppladdningar går igenom.
+               SLING_MAX_PER_IP="12",
                SLING_SOCKET_TIMEOUT="3",
                # Förfrågans och kroppens frister: korta i provet så att de går att mäta
                # (se DeadlineReader och proven nedanför takprovet).
@@ -2270,6 +2340,13 @@ def cmd_selftest(abuse=False):
                 return r.status, json.loads(r.read())
         except urllib.error.HTTPError as e:
             return e.code, {}
+
+    def lever(pid):
+        try:
+            with open("/proc/%s/stat" % pid) as fh:
+                return fh.read().split()[2] != "Z"           # Z = skördad, alltså borta
+        except OSError:
+            return False
 
     try:
         for _ in range(80):
@@ -2361,6 +2438,60 @@ def cmd_selftest(abuse=False):
         check("precis på inodgolvet går igenom",
               utrymme_slut(0, katalog=_här,
                            vfs=_vfs(f_files=1 << 20, f_ffree=MIN_FREE_FILES + MAX_PARTS)) is False)
+
+        # Kontraktet mellan panelen och servern: docken läser dessa nycklar ur varje post i
+        # listan. Byter någon namn i Python står det "undefined" i baren — utan QML-varning
+        # och utan rad i journalen — så filerna jämförs mot varandra i stället.
+        # Panelen ligger ett steg upp i plugin-mappen (BarWidget.qml + bin/omarchy-sling),
+        # men en kopia av skriptet kan ligga i samma katalog som filen. Båda letas upp, så
+        # kontrollen mäter layouten i stället för att gissa en sökväg.
+        _här_under = os.path.dirname(os.path.abspath(__file__))
+        qml_väg = next((p for p in (os.path.join(os.path.dirname(_här_under), "BarWidget.qml"),
+                                    os.path.join(_här_under, "BarWidget.qml"))
+                        if os.path.exists(p)), "")
+        try:
+            with open(qml_väg, encoding="utf-8") as fh:
+                qml = fh.read()
+        except OSError:
+            qml = ""
+        # Bara docken: skicka-köns rader har egna nycklar (name/size), och en bred
+        # sökning hade jämfört dem mot överföringens post.
+        _start, _slut = qml.find("Transfer-dock"), qml.find("// Skicka-kön")
+        dock = qml[_start:_slut] if 0 <= _start < _slut else ""
+        nycklar = set(re.findall(r"(?:modelData|transfer)\.([a-z_]+)", dock))
+        # Inte "post": det namnet är den egna hjälpen längre upp i samma funktion, och en
+        # lokal med samma namn skuggar den för HELA funktionen (mätt: TypeError i provet).
+        aktiv_post = {"dir": "up", "name": "x.bin", "done": 1, "total": 2, "pct": 50,
+                      "speed": 1.0, "human_done": "1 B", "human_total": "2 B"}
+        saknas = sorted(k for k in nycklar if k not in aktiv_post)
+        # Inventeringssiffrorna i README drev i väg varje gång sviten växte (mätt två rundor
+        # i rad), så nu jämförs prosan med det sviten själv räknar — annars är siffran en
+        # anteckning, inte ett påstående.
+        räkning = {}
+        for _n, _ok, _d in granska_sankor():
+            if _n.startswith("inventeringen: ") and _n.endswith(" takade") and _d:
+                _m = re.match(r"(\d+) anrop", _d)
+                if _m:
+                    räkning[_n.split(": ")[1].split(" ")[0]] = int(_m.group(1))
+        _readme = next((p for p in (os.path.join(os.path.dirname(_här_under), "README.md"),
+                                    os.path.join(_här_under, "README.md")) if os.path.exists(p)), "")
+        try:
+            with open(_readme, encoding="utf-8") as fh:
+                _prosa = fh.read()
+        except OSError:
+            _prosa = ""
+        _siffror = re.search(r"(\d+) subprocess calls, (\d+) reads, (\d+) waits? and (\d+) "
+                             r"network calls?", _prosa)
+        _väntat = [int(x) for x in _siffror.groups()] if _siffror else []
+        _faktiskt = [räkning.get("processer"), räkning.get("läsningar"),
+                     räkning.get("väntningar"), räkning.get("nät")]
+        check("README:s inventeringssiffror stämmer med svitens räkning",
+              bool(_siffror) and _väntat == _faktiskt,
+              "README %s mot sviten %s" % (_väntat, _faktiskt))
+
+        check("panelens nycklar finns i serverns aktiva-post (%d nycklar)" % len(nycklar),
+              bool(dock) and bool(nycklar) and not saknas,
+              "nycklar: %s | saknas: %s" % (sorted(nycklar), saknas) if qml else "BarWidget.qml går inte att läsa")
 
         # Inventeringen: klassen, inte fyndet. Varje strypkoppling i filen — varje
         # processanrop, läsning, väntan och nätläsning — måste vara takad eller stå
@@ -2792,13 +2923,6 @@ def cmd_selftest(abuse=False):
             fh.write("#!/bin/sh\nsleep 4321 &\necho \"$$ $!\" > '%s'\nexec sleep 4321\n" % pidfil)
         os.chmod(kalla, 0o755)
 
-        def lever(pid):
-            try:
-                with open("/proc/%s/stat" % pid) as fh:
-                    return fh.read().split()[2] != "Z"       # Z = skördad, alltså borta
-            except OSError:
-                return False
-
         svar_barn = {}
         globals()["CLIP_TIMEOUT"] = 1.5
         try:
@@ -3022,6 +3146,14 @@ def cmd_selftest(abuse=False):
         bump_transfer(b, 500)
         bump_transfer(a, 100)          # den äldre räknar vidare utan att röra den senare
         nu = active_dict()
+        # Panelen ritar en rad per överföring: listan är hela svaret, "active" är den
+        # första posten i den (så procenten räknas på ett ställe).
+        lista = aktiva_lista()
+        check("listan bär båda överföringarna, senast startade först",
+              [x["name"] for x in lista] == ["b.iso", "a.bin"], str([x["name"] for x in lista]))
+        check("  ... och den första posten är samma som panelens active",
+              bool(nu) and lista and lista[0]["name"] == nu["name"] and lista[0]["pct"] == nu["pct"]
+              and lista[0]["dir"] == nu["dir"])
         check("två samtidiga överföringar blandas inte: panelen visar den senaste",
               bool(nu) and nu["name"] == "b.iso" and nu["dir"] == "down" and nu["done"] == 500
               and nu["total"] == 2000 and nu["pct"] == 25, str(nu))
@@ -3040,6 +3172,16 @@ def cmd_selftest(abuse=False):
             cli_active = json.loads(cli.stdout).get("active")
         except ValueError:
             cli_active = None
+        # Listan måste gå samma väg: den bor i serverns minne, och panelen pollar CLI:t.
+        try:
+            cli_actives = json.loads(cli.stdout).get("actives") or []
+        except ValueError:
+            cli_actives = []
+        check("CLI-status bär hela listan (panelen ritar en rad per överföring)",
+              isinstance(cli_actives, list) and bool(cli_actives)
+              and cli_actives[0].get("name") == "stor3.bin"
+              and cli_actives[0].get("name") == (cli_active or {}).get("name"),
+              str(cli_actives)[:80])
         check("CLI-status visar samma pågående överföring", bool(cli_active) and cli_active.get("name") == "stor3.bin",
               (cli_active and "%s %d%%" % (cli_active["name"], cli_active["pct"])) or ("utdata: " + cli.stdout[:60]))
         done.wait(timeout=60)
@@ -4269,6 +4411,33 @@ def cmd_abuse(h, port, token, tmp):
             break
     check("abuse: 200 tysta anslutningar hålls under anslutningstaket",
           under_tradar <= tak + 4, "%d trådar (tak %d)" % (under_tradar, tak))
+    # Per adress: en motpart ska inte kunna ta hela tabellen själv. Servern kör med
+    # SLING_MAX_PER_IP=12, så den trettonde anslutningen från samma adress ska avvisas
+    # medan det globala taket (16) har plats kvar — annars mäter cellen det gamla taket.
+    per_adress = int(h["env"].get("SLING_MAX_PER_IP", "16"))
+    idla = []
+    for _ in range(per_adress):
+        idla.append(socket.create_connection(("127.0.0.1", port), timeout=5))
+    extra = socket.create_connection(("127.0.0.1", port), timeout=5)
+    extra.settimeout(3)
+    try:
+        svar_extra = extra.recv(200)
+    except OSError:
+        svar_extra = b""
+    extra.close()
+    for s in idla:
+        s.close()
+    check("abuse: en adress kan inte ta hela tabellen (den %d:e får 503)" % (per_adress + 1),
+          b"503" in svar_extra, (svar_extra.split(b"\r\n")[0] or b"(inget svar)")[:40].decode(errors="replace"))
+    släppt = False
+    for _ in range(25):
+        time.sleep(0.2)
+        svar, _ = raw(b"GET /t/%s/status HTTP/1.0\r\n\r\n" % token.encode())
+        if kod(svar) == 200:
+            släppt = True
+            break
+    check("abuse: ... och platsen släpps när anslutningarna stängs", släppt and lever_efter())
+
     check("abuse: ... och allt släpps tillbaka till vila",
           efter_tradar <= före_tradar + 3 and efter_fds <= före_fds + 5,
           "%d/%d mot %d/%d i vila" % (efter_tradar, efter_fds, före_tradar, före_fds))

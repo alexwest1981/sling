@@ -26,6 +26,11 @@ BarWidget {
   property var recentFiles: []
   property var sendFiles: []
   property var transfer: null
+  // Alla pågående överföringar, senast startade först. "transfer" är den första av dem
+  // (barens etikett och telefonsidan), listan är det docken ritar: med bara den senaste
+  // syntes en nedladdning inte alls medan en uppladdning rullade.
+  property var actives: []
+  readonly property var extraTransfers: root.actives.length > 1 ? root.actives.slice(1, 4) : []
   property bool popupOpen: false
   property string qrPath: ""
   property int refreshTrigger: 0
@@ -238,6 +243,7 @@ BarWidget {
           root.recentFiles = data.recent_files || []
           root.sendFiles = data.send_files || []
           root.transfer = data.active || null
+          root.actives = data.actives || []
           root.qrPath = data.qr_path || ""
           root.refreshTrigger += 1
         } catch (e) {
@@ -569,7 +575,7 @@ BarWidget {
       // fart medan en fil rullar; annars en dämpad rad och tom stapel.
       BorderSurface {
         width: parent.width
-        height: Style.space(74)
+        height: Style.space(74) + root.extraTransfers.length * Style.space(15)
         radius: Style.space(6)
         color: Qt.rgba(0, 0.94, 1, root.transfer ? 0.07 : 0.03)
         borderSpec: Border.controlSpec("normal", root.neonCyan, root.neonCyan)
@@ -637,6 +643,27 @@ BarWidget {
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.caption
             elide: Text.ElideRight
+          }
+
+          // Fler än en samtidigt (t.ex. en nedladdning medan en uppladdning rullar):
+          // den senaste rullar i raden ovanför, de övriga listas, högst tre.
+          Repeater {
+            model: root.extraTransfers
+
+            delegate: Text {
+              required property var modelData
+              width: parent.width
+              // Riktningspilen som kodpunkt: en literal flerbytesglyf kan strykas av
+              // filverktyg, och då står en tom ruta i baren.
+              text: String.fromCodePoint(modelData.dir === "up" ? 0x1F4E5 : 0x1F4E4)
+                    + " " + modelData.name + "  " + modelData.pct + " %"
+              // Filnamn är data, inte uppmärkning (samma skäl som raden ovanför).
+              textFormat: Text.PlainText
+              color: Qt.darker(root.bar.foreground, 1.25)
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideMiddle
+            }
           }
         }
       }
