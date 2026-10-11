@@ -1150,7 +1150,21 @@ class SlingHandler(BaseHTTPRequestHandler):
         self._send(403, ("Sling is running. Use the link or QR code from the bar panel.\n"
                          "Sling körs. Använd länken eller QR-koden i panelen.\n").encode())
 
+    def _stäng_om_kroppen_lämnades(self):
+        """Svar på en förfrågan vars deklarerade kropp vi inte läser.
+
+        En kropp som ligger kvar i socketen tolkas annars som nästa förfrågan på samma
+        anslutning. Mätt på HTTP/1.1 (keep-alive): ett POST till /upload med JSON-rubrik
+        och en gömd GET i kroppen gav 400 följt av 200 — två svar på en förfrågan — och
+        likadant för ett POST till en okänd väg (404 följt av 200). Tak-vägarna (/upload
+        och /clip över taket) tömmer kroppen och stänger själva; den här stänger varje
+        väg som lämnar den oläst, inklusive GET och HEAD med en kropp.
+        """
+        if self.headers.get("Content-Length", "").strip() not in ("", "0"):
+            self.close_connection = True
+
     def do_HEAD(self):
+        self._stäng_om_kroppen_lämnades()
         rest = self._resolve()
         if rest is None:
             self._no_token()
@@ -1158,6 +1172,7 @@ class SlingHandler(BaseHTTPRequestHandler):
             self._send(200)
 
     def do_GET(self):
+        self._stäng_om_kroppen_lämnades()
         rest = self._resolve()
         if rest is None:
             self._no_token()
@@ -1286,12 +1301,14 @@ class SlingHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         rest = self._resolve()
         if rest is None:
+            self._stäng_om_kroppen_lämnades()
             self._no_token()
             return
         if rest == "/clip":
             self._receive_clip()
             return
         if rest != "/upload":
+            self._stäng_om_kroppen_lämnades()
             self._send(404)
             return
 
@@ -1301,6 +1318,7 @@ class SlingHandler(BaseHTTPRequestHandler):
         except ValueError:
             length = 0
         if not ctype.startswith("multipart/form-data") or length == 0:
+            self._stäng_om_kroppen_lämnades()
             self._send(400)
             return
         # Kroppens frist (se DeadlineReader). Över taket läses bara den del som ändå ska
@@ -3835,6 +3853,43 @@ def cmd_abuse(h, port, token, tmp):
             os.remove(os.path.join(received, namn))
         except OSError:
             pass
+
+    # En kropp vi inte läser ligger kvar i socketen och blev nästa förfrågan på samma
+    # anslutning. Mätt på HTTP/1.1: ett POST till /upload med JSON-rubrik och en gömd GET
+    # i kroppen gav 400 följt av 200 — TVÅ svar på en förfrågan — och ett POST till en
+    # okänd väg gav 404 följt av 200. En förfrågan ska ge ett svar, och en kropp som
+    # lämnas oläst ska stänga anslutningen (tak-vägarna tömmer och stänger själva).
+    def svar_på_en_förfrågan(förfrågan, vänta=1.5):
+        s = socket.create_connection(("127.0.0.1", port), timeout=6)
+        s.sendall(förfrågan)
+        s.settimeout(vänta)
+        buf, stängd = b"", False
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < vänta:
+            try:
+                bit = s.recv(65536)
+            except socket.timeout:
+                break
+            except OSError:
+                stängd = True
+                break
+            if not bit:
+                stängd = True
+                break
+            buf += bit
+        s.close()
+        return buf.count(b"HTTP/1."), stängd
+
+    gömd = b"GET /t/%s/status HTTP/1.1\r\nHost: x\r\n\r\n" % token.encode()
+    for vad, huvud, arg in (("fel Content-Type",
+                             "POST /t/%s/upload HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n", token),
+                            ("okänd väg", "POST /t/%s/finns-inte HTTP/1.1\r\nHost: x\r\n", token),
+                            ("GET med kropp", "GET /t/%s/status HTTP/1.1\r\nHost: x\r\n", token),
+                            ("fel token", "POST /t/%s/upload HTTP/1.1\r\nHost: x\r\n", "fel-token")):
+        antal, stängd = svar_på_en_förfrågan((huvud % arg).encode()
+                                             + b"Content-Length: %d\r\n\r\n" % len(gömd) + gömd)
+        check("abuse: en oläst kropp blir inte nästa förfrågan (%s)" % vad,
+              antal == 1 and stängd, "%d svar, stängd=%s" % (antal, stängd))
 
     # Ett misslyckat sparande skickade förr str(exc) till telefonen: mätt innehöll 500-svaret
     # "[Errno 13] Permission denied: /home/…/Received/b.bin". Detaljen stannar nu i loggen,
